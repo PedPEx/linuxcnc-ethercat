@@ -5,17 +5,19 @@
 ///        1-channel incremental encoder interface, IP67, D-SUB15
 ///
 /// PDO mapping:
-///   SM2 RxPDO 0x1601 "ENC Control"       6 bytes
-///             0x7000:01..04  Control bits (4x 1-bit)
-///             0x7000:11      Set counter value (UDINT 32-bit)
+///   SM2 RxPDO 0x1601 "ENC Control"    6 bytes
+///   SM3 TxPDO 0x1A01 "ENC Status"    10 bytes
 ///
-///   SM3 TxPDO 0x1A01 "ENC Status"        10 bytes
-///             0x6000:01..0D  Status bits  (13x 1-bit)
-///             0x1C32:20      Sync error   (1-bit)
-///             0x1801:09      TxPDO State  (1-bit)
-///             gap            TxPDO Toggle (1-bit)
-///             0x6000:11      Counter value (UDINT 32-bit)
-///             0x6000:12      Latch value   (UDINT 32-bit)
+/// All 0x8000 device configuration registers are exposed as modParams
+/// in ethercat-conf.xml, e.g.:
+///   <slave idx="9" type="EP5101" name="enc1">
+///     <modParam name="enableCReset"    value="1"/>
+///     <modParam name="enableUpDown"    value="1"/>
+///     <modParam name="gatePolarity"    value="0"/>
+///     <modParam name="disableFilter"   value="0"/>
+///     <modParam name="enableMicroInc"  value="0"/>
+///     <modParam name="revRotation"     value="0"/>
+///   </slave>
 
 #include "../lcec.h"
 
@@ -24,14 +26,67 @@ static int  lcec_ep5101_init(int comp_id, lcec_slave_t *slave);
 static void lcec_ep5101_read(lcec_slave_t *slave, long period);
 static void lcec_ep5101_write(lcec_slave_t *slave, long period);
 
+// ── modParam IDs ─────────────────────────────────────────────────────────────
+// Each ID maps to one SDO subindex in object 0x8000.
+enum {
+    MP_ENABLE_C_RESET    = 1,  // 0x8000:01  Enable C reset
+    MP_ENABLE_EXT_RESET  = 2,  // 0x8000:02  Enable extern reset
+    MP_ENABLE_UP_DOWN    = 3,  // 0x8000:03  Enable up/down counter
+    MP_GATE_POLARITY     = 4,  // 0x8000:04  Gate polarity
+    MP_DISABLE_FILTER    = 5,  // 0x8000:08  Disable filter
+    MP_ENABLE_MICRO_INC  = 6,  // 0x8000:0A  Enable micro increments
+    MP_REV_ROTATION      = 7,  // 0x8000:0E  Reversion of rotation
+    MP_EXT_RESET_POL     = 8,  // 0x8000:10  Extern reset polarity
+    MP_FREQ_WINDOW       = 9,  // 0x8000:11  Frequency window
+    MP_FREQ_SCALING      = 10, // 0x8000:13  Frequency scaling
+    MP_PERIOD_SCALING    = 11, // 0x8000:14  Period scaling
+    MP_FREQ_RESOLUTION   = 12, // 0x8000:15  Frequency resolution
+    MP_PERIOD_RESOLUTION = 13, // 0x8000:16  Period resolution
+    MP_WAIT_TIME         = 14, // 0x8000:17  Frequency wait time
+};
+
+// ── modParam descriptor table ────────────────────────────────────────────────
+// Columns: name, id, type, default_value, config_comment
+static lcec_modparam_desc_t lcec_ep5101_modparams[] = {
+    {"enableCReset",     MP_ENABLE_C_RESET,    MODPARAM_TYPE_BIT,
+     "1",  "0x8000:01 Enable C reset (index pulse resets counter)"},
+    {"enableExtReset",   MP_ENABLE_EXT_RESET,  MODPARAM_TYPE_BIT,
+     "0",  "0x8000:02 Enable extern reset via external input"},
+    {"enableUpDown",     MP_ENABLE_UP_DOWN,    MODPARAM_TYPE_BIT,
+     "1",  "0x8000:03 Enable up/down counter (direction from B-track)"},
+    {"gatePolarity",     MP_GATE_POLARITY,     MODPARAM_TYPE_BIT,
+     "0",  "0x8000:04 Gate polarity (0=active LOW, 1=active HIGH)"},
+    {"disableFilter",    MP_DISABLE_FILTER,    MODPARAM_TYPE_BIT,
+     "0",  "0x8000:08 Disable input filter (0=filter active, 1=disabled)"},
+    {"enableMicroInc",   MP_ENABLE_MICRO_INC,  MODPARAM_TYPE_BIT,
+     "0",  "0x8000:0A Enable micro increments"},
+    {"revRotation",      MP_REV_ROTATION,      MODPARAM_TYPE_BIT,
+     "0",  "0x8000:0E Reversion of rotation (0=normal, 1=inverted)"},
+    {"extResetPolarity", MP_EXT_RESET_POL,     MODPARAM_TYPE_BIT,
+     "0",  "0x8000:10 Extern reset polarity (0=rising edge)"},
+    {"freqWindow",       MP_FREQ_WINDOW,       MODPARAM_TYPE_U32,
+     "0",  "0x8000:11 Frequency window"},
+    {"freqScaling",      MP_FREQ_SCALING,      MODPARAM_TYPE_U32,
+     "0",  "0x8000:13 Frequency scaling"},
+    {"periodScaling",    MP_PERIOD_SCALING,    MODPARAM_TYPE_U32,
+     "0",  "0x8000:14 Period scaling"},
+    {"freqResolution",   MP_FREQ_RESOLUTION,   MODPARAM_TYPE_U32,
+     "0",  "0x8000:15 Frequency resolution"},
+    {"periodResolution", MP_PERIOD_RESOLUTION, MODPARAM_TYPE_U32,
+     "0",  "0x8000:16 Period resolution"},
+    {"waitTime",         MP_WAIT_TIME,         MODPARAM_TYPE_U32,
+     "0",  "0x8000:17 Frequency wait time"},
+    {NULL},
+};
+
 // ── Self-registration ────────────────────────────────────────────────────────
 static lcec_typelist_t types[] = {
-    {"EP5101", LCEC_BECKHOFF_VID, 0x13ED4052, 0, NULL, lcec_ep5101_init},
+    {"EP5101", LCEC_BECKHOFF_VID, 0x13ED4052, 0, NULL, lcec_ep5101_init, lcec_ep5101_modparams},
     {NULL},
 };
 ADD_TYPES(types);
 
-// ── Status word bit masks (16-bit, TxPDO 0x1A01, bytes 0-1) ─────────────────
+// ── Status word bit masks (TxPDO 0x1A01, bytes 0-1) ─────────────────────────
 #define EP5101_STS_LATCH_C_VALID   (1u <<  0)  // 0x6000:01
 #define EP5101_STS_LATCH_EXT_VALID (1u <<  1)  // 0x6000:02
 #define EP5101_STS_CNT_SET_DONE    (1u <<  2)  // 0x6000:03
@@ -49,66 +104,54 @@ ADD_TYPES(types);
 #define EP5101_STS_TXPDO_STATE     (1u << 14)  // 0x1801:09
 #define EP5101_STS_TXPDO_TOGGLE    (1u << 15)  // gap bit
 
-// ── Control word bit masks (16-bit, RxPDO 0x1601, bytes 0-1) ────────────────
+// ── Control word bit masks (RxPDO 0x1601, bytes 0-1) ────────────────────────
 #define EP5101_CTRL_ENA_LATCH_C       (1u << 0)  // 0x7000:01
 #define EP5101_CTRL_ENA_LATCH_EXT_POS (1u << 1)  // 0x7000:02
 #define EP5101_CTRL_SET_COUNTER       (1u << 2)  // 0x7000:03
 #define EP5101_CTRL_ENA_LATCH_EXT_NEG (1u << 3)  // 0x7000:04
 
-// ── PDO object addresses (used for lcec_pdo_init offset registration) ────────
+// ── PDO object addresses ─────────────────────────────────────────────────────
 #define EP5101_STATUS_IDX    0x6000
-#define EP5101_STATUS_SIDX   0x01    // anchor: first status bit -> byte offset
-
+#define EP5101_STATUS_SIDX   0x01
 #define EP5101_COUNT_IDX     0x6000
-#define EP5101_COUNT_SIDX    0x11    // Counter value (UDINT 32-bit)
-
+#define EP5101_COUNT_SIDX    0x11
 #define EP5101_LATCH_IDX     0x6000
-#define EP5101_LATCH_SIDX    0x12    // Latch value (UDINT 32-bit)
-
+#define EP5101_LATCH_SIDX    0x12
 #define EP5101_CTRL_IDX      0x7000
-#define EP5101_CTRL_SIDX     0x01    // anchor: first control bit -> byte offset
-
+#define EP5101_CTRL_SIDX     0x01
 #define EP5101_SETCNT_IDX    0x7000
-#define EP5101_SETCNT_SIDX   0x11    // Set counter value (UDINT 32-bit)
+#define EP5101_SETCNT_SIDX   0x11
 
 // ── PDO entry definitions ─────────────────────────────────────────────────────
-// RxPDO 0x1601 "ENC Control" -- 6 bytes total
-//   Byte 0:  bits 0-3 used, bits 4-7 padding
-//   Byte 1:  padding
-//   Bytes 2-5: Set counter value (UDINT)
 static ec_pdo_entry_info_t lcec_ep5101_out[] = {
-    {0x7000, 0x01,  1},   // Enable latch C
-    {0x7000, 0x02,  1},   // Enable latch extern on positive edge
-    {0x7000, 0x03,  1},   // Set counter
-    {0x7000, 0x04,  1},   // Enable latch extern on negative edge
-    {0x0000, 0x00,  4},   // Padding (bits 4-7 of byte 0)
-    {0x0000, 0x00,  8},   // Padding (byte 1)
-    {0x7000, 0x11, 32},   // Set counter value
+    {0x7000, 0x01,  1},  // Enable latch C
+    {0x7000, 0x02,  1},  // Enable latch extern pos edge
+    {0x7000, 0x03,  1},  // Set counter
+    {0x7000, 0x04,  1},  // Enable latch extern neg edge
+    {0x0000, 0x00,  4},  // Padding bits 4-7
+    {0x0000, 0x00,  8},  // Padding byte 1
+    {0x7000, 0x11, 32},  // Set counter value
 };
 
-// TxPDO 0x1A01 "ENC Status" -- 10 bytes total
-//   Bytes 0-1: Status word (16 x 1-bit entries)
-//   Bytes 2-5: Counter value (UDINT)
-//   Bytes 6-9: Latch value (UDINT)
 static ec_pdo_entry_info_t lcec_ep5101_in[] = {
-    {0x6000, 0x01,  1},   // Latch C valid
-    {0x6000, 0x02,  1},   // Latch extern valid
-    {0x6000, 0x03,  1},   // Set counter done
-    {0x6000, 0x04,  1},   // Counter underflow
-    {0x6000, 0x05,  1},   // Counter overflow
-    {0x6000, 0x06,  1},   // Status of input status
-    {0x6000, 0x07,  1},   // Open circuit
-    {0x6000, 0x08,  1},   // Extrapolation stall
-    {0x6000, 0x09,  1},   // Status of input A
-    {0x6000, 0x0A,  1},   // Status of input B
-    {0x6000, 0x0B,  1},   // Status of input C
-    {0x6000, 0x0C,  1},   // Status of input gate
-    {0x6000, 0x0D,  1},   // Status of extern latch
-    {0x1C32, 0x20,  1},   // Sync error
-    {0x1801, 0x09,  1},   // TxPDO State
-    {0x0000, 0x00,  1},   // TxPDO Toggle (gap)
-    {0x6000, 0x11, 32},   // Counter value
-    {0x6000, 0x12, 32},   // Latch value
+    {0x6000, 0x01,  1},  // Latch C valid
+    {0x6000, 0x02,  1},  // Latch extern valid
+    {0x6000, 0x03,  1},  // Set counter done
+    {0x6000, 0x04,  1},  // Counter underflow
+    {0x6000, 0x05,  1},  // Counter overflow
+    {0x6000, 0x06,  1},  // Status of input status
+    {0x6000, 0x07,  1},  // Open circuit
+    {0x6000, 0x08,  1},  // Extrapolation stall
+    {0x6000, 0x09,  1},  // Status of input A
+    {0x6000, 0x0A,  1},  // Status of input B
+    {0x6000, 0x0B,  1},  // Status of input C
+    {0x6000, 0x0C,  1},  // Status of input gate
+    {0x6000, 0x0D,  1},  // Status of extern latch
+    {0x1C32, 0x20,  1},  // Sync error
+    {0x1801, 0x09,  1},  // TxPDO State
+    {0x0000, 0x00,  1},  // TxPDO Toggle (gap)
+    {0x6000, 0x11, 32},  // Counter value
+    {0x6000, 0x12, 32},  // Latch value
 };
 
 static ec_pdo_info_t lcec_ep5101_pdos_out[] = {
@@ -120,73 +163,71 @@ static ec_pdo_info_t lcec_ep5101_pdos_in[] = {
 };
 
 static ec_sync_info_t lcec_ep5101_syncs[] = {
-    {0, EC_DIR_OUTPUT, 0, NULL,                  EC_WD_DISABLE},
-    {1, EC_DIR_INPUT,  0, NULL,                  EC_WD_DISABLE},
-    {2, EC_DIR_OUTPUT, 1, lcec_ep5101_pdos_out,  EC_WD_ENABLE},
-    {3, EC_DIR_INPUT,  1, lcec_ep5101_pdos_in,   EC_WD_DISABLE},
+    {0, EC_DIR_OUTPUT, 0, NULL,                 EC_WD_DISABLE},
+    {1, EC_DIR_INPUT,  0, NULL,                 EC_WD_DISABLE},
+    {2, EC_DIR_OUTPUT, 1, lcec_ep5101_pdos_out, EC_WD_ENABLE},
+    {3, EC_DIR_INPUT,  1, lcec_ep5101_pdos_in,  EC_WD_DISABLE},
     {0xff},
 };
 
 // ── HAL data structure ───────────────────────────────────────────────────────
 typedef struct {
-    // PDO byte offsets (set by lcec_pdo_init)
-    unsigned int status_pdo_os;    // byte offset of status word (0x6000:01)
-    unsigned int status_pdo_bp;    // bit position (should be 0)
-    unsigned int count_pdo_os;     // byte offset of counter value
-    unsigned int latch_pdo_os;     // byte offset of latch value
-    unsigned int ctrl_pdo_os;      // byte offset of control word (0x7000:01)
-    unsigned int ctrl_pdo_bp;      // bit position (should be 0)
-    unsigned int setcnt_pdo_os;    // byte offset of set-counter value
+    unsigned int status_pdo_os;
+    unsigned int status_pdo_bp;
+    unsigned int count_pdo_os;
+    unsigned int latch_pdo_os;
+    unsigned int ctrl_pdo_os;
+    unsigned int ctrl_pdo_bp;
+    unsigned int setcnt_pdo_os;
 
-    // -- TxPDO status bits -- HAL OUT pins ------------------------------------
-    hal_bit_t   *latch_c_valid;     // Status bit  0: Latch C valid
-    hal_bit_t   *latch_ext_valid;   // Status bit  1: Latch extern valid
-    hal_bit_t   *cnt_set_done;      // Status bit  2: Set counter done
-    hal_bit_t   *underflow;         // Status bit  3: Counter underflow
-    hal_bit_t   *overflow;          // Status bit  4: Counter overflow
-    hal_bit_t   *input_status;      // Status bit  5: Status of input (ext. signal OK)
-    hal_bit_t   *open_circuit;      // Status bit  6: Open circuit detected
-    hal_bit_t   *extrap_stall;      // Status bit  7: Extrapolation stall
-    hal_bit_t   *input_a;           // Status bit  8: State of input A
-    hal_bit_t   *input_b;           // Status bit  9: State of input B
-    hal_bit_t   *input_c;           // Status bit 10: State of input C (index)
-    hal_bit_t   *input_gate;        // Status bit 11: State of gate input
-    hal_bit_t   *ext_latch_status;  // Status bit 12: State of extern latch input
-    hal_bit_t   *sync_error;        // Status bit 13: EtherCAT sync error
-    hal_bit_t   *txpdo_state;       // Status bit 14: TxPDO state
-    hal_bit_t   *txpdo_toggle;      // Status bit 15: TxPDO toggle
+    // Status bit pins (OUT)
+    hal_bit_t   *latch_c_valid;
+    hal_bit_t   *latch_ext_valid;
+    hal_bit_t   *cnt_set_done;
+    hal_bit_t   *underflow;
+    hal_bit_t   *overflow;
+    hal_bit_t   *input_status;
+    hal_bit_t   *open_circuit;
+    hal_bit_t   *extrap_stall;
+    hal_bit_t   *input_a;
+    hal_bit_t   *input_b;
+    hal_bit_t   *input_c;
+    hal_bit_t   *input_gate;
+    hal_bit_t   *ext_latch_status;
+    hal_bit_t   *sync_error;
+    hal_bit_t   *txpdo_state;
+    hal_bit_t   *txpdo_toggle;
 
-    // -- TxPDO data -- HAL OUT pins -------------------------------------------
-    hal_u32_t   *status_raw;        // Full 16-bit status word (raw, for debugging)
-    hal_s32_t   *raw_count;         // Raw 32-bit counter value from device
-    hal_s32_t   *count;             // Accumulated count (corrects for 32-bit rollover)
-    hal_s32_t   *latch_val;         // Latch value
-    hal_float_t *pos;               // Position = count / pos_scale
-    hal_float_t *pos_scale;         // Scaling: increments per machine unit (IO)
+    // Data pins (OUT)
+    hal_u32_t   *status_raw;
+    hal_s32_t   *raw_count;
+    hal_s32_t   *count;
+    hal_s32_t   *latch_val;
+    hal_float_t *pos;
+    hal_float_t *pos_scale;
 
-    // -- RxPDO control bits -- HAL IO pins ------------------------------------
-    hal_bit_t   *ena_latch_c;       // Control bit 0: Enable latch on C/index pulse
-    hal_bit_t   *ena_latch_ext_pos; // Control bit 1: Enable latch on ext pos edge
-    hal_bit_t   *set_counter;       // Control bit 2: Pulse HIGH to load preset
-    hal_bit_t   *ena_latch_ext_neg; // Control bit 3: Enable latch on ext neg edge
+    // Control bit pins (IO)
+    hal_bit_t   *ena_latch_c;
+    hal_bit_t   *ena_latch_ext_pos;
+    hal_bit_t   *set_counter;
+    hal_bit_t   *ena_latch_ext_neg;
 
-    // -- Preset / reset -- HAL pins -------------------------------------------
-    hal_s32_t   *set_raw_count_val; // IN:  value to preset counter to
-    hal_bit_t   *set_raw_count;     // IO:  pulse HIGH to trigger preset (auto-clears)
-    hal_bit_t   *reset;             // IN:  set HIGH to zero the software accumulator
+    // Preset / reset pins
+    hal_s32_t   *set_raw_count_val;
+    hal_bit_t   *set_raw_count;
+    hal_bit_t   *reset;
 
-    // -- Internal state -------------------------------------------------------
-    int32_t     last_count;         // previous raw_count for delta calculation
-    int64_t     accum;              // 64-bit software accumulator
-    int         do_init;            // 1 = seed accumulator on first valid cycle
-    double      scale;              // cached 1.0 / pos_scale
-    double      old_scale;          // detect scale changes
-    int         last_operational;   // edge detection for PREOP->OP transition
+    // Internal state
+    int32_t     last_count;
+    int64_t     accum;
+    int         do_init;
+    double      scale;
+    double      old_scale;
+    int         last_operational;
 } lcec_ep5101_data_t;
 
 // ── HAL pin descriptor table ─────────────────────────────────────────────────
 static const lcec_pindesc_t slave_pins[] = {
-    // Status bits (OUT)
     {HAL_BIT,   HAL_OUT, offsetof(lcec_ep5101_data_t, latch_c_valid),
                 "%s.%s.%s.enc-latch-c-valid"},
     {HAL_BIT,   HAL_OUT, offsetof(lcec_ep5101_data_t, latch_ext_valid),
@@ -219,7 +260,6 @@ static const lcec_pindesc_t slave_pins[] = {
                 "%s.%s.%s.enc-txpdo-state"},
     {HAL_BIT,   HAL_OUT, offsetof(lcec_ep5101_data_t, txpdo_toggle),
                 "%s.%s.%s.enc-txpdo-toggle"},
-    // Data (OUT)
     {HAL_U32,   HAL_OUT, offsetof(lcec_ep5101_data_t, status_raw),
                 "%s.%s.%s.enc-status-raw"},
     {HAL_S32,   HAL_OUT, offsetof(lcec_ep5101_data_t, raw_count),
@@ -232,7 +272,6 @@ static const lcec_pindesc_t slave_pins[] = {
                 "%s.%s.%s.enc-pos"},
     {HAL_FLOAT, HAL_IO,  offsetof(lcec_ep5101_data_t, pos_scale),
                 "%s.%s.%s.enc-pos-scale"},
-    // Control bits (IO)
     {HAL_BIT,   HAL_IO,  offsetof(lcec_ep5101_data_t, ena_latch_c),
                 "%s.%s.%s.enc-ena-latch-c"},
     {HAL_BIT,   HAL_IO,  offsetof(lcec_ep5101_data_t, ena_latch_ext_pos),
@@ -241,7 +280,6 @@ static const lcec_pindesc_t slave_pins[] = {
                 "%s.%s.%s.enc-set-counter"},
     {HAL_BIT,   HAL_IO,  offsetof(lcec_ep5101_data_t, ena_latch_ext_neg),
                 "%s.%s.%s.enc-ena-latch-ext-neg"},
-    // Preset / reset
     {HAL_S32,   HAL_IN,  offsetof(lcec_ep5101_data_t, set_raw_count_val),
                 "%s.%s.%s.enc-set-raw-count-val"},
     {HAL_BIT,   HAL_IO,  offsetof(lcec_ep5101_data_t, set_raw_count),
@@ -251,43 +289,114 @@ static const lcec_pindesc_t slave_pins[] = {
     {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
+// ── modParam SDO write helper ─────────────────────────────────────────────────
+// Writes only the 0x8000 SDOs that are explicitly set in the XML.
+// Parameters not listed in the XML keep their device power-on defaults.
+static int lcec_ep5101_write_modparams(lcec_slave_t *slave) {
+    lcec_master_t        *master = slave->master;
+    lcec_slave_modparam_t *p;
+
+    for (p = slave->modparams; p != NULL && p->id >= 0; p++) {
+        switch (p->id) {
+            case MP_ENABLE_C_RESET:
+                if (lcec_write_sdo8(slave, 0x8000, 0x01,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_ENABLE_EXT_RESET:
+                if (lcec_write_sdo8(slave, 0x8000, 0x02,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_ENABLE_UP_DOWN:
+                if (lcec_write_sdo8(slave, 0x8000, 0x03,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_GATE_POLARITY:
+                if (lcec_write_sdo8(slave, 0x8000, 0x04,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_DISABLE_FILTER:
+                if (lcec_write_sdo8(slave, 0x8000, 0x08,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_ENABLE_MICRO_INC:
+                if (lcec_write_sdo8(slave, 0x8000, 0x0A,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_REV_ROTATION:
+                if (lcec_write_sdo8(slave, 0x8000, 0x0E,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_EXT_RESET_POL:
+                if (lcec_write_sdo8(slave, 0x8000, 0x10,
+                                     p->value.bit ? 1 : 0) != 0) goto sdo_err;
+                break;
+            case MP_FREQ_WINDOW:
+                if (lcec_write_sdo16(slave, 0x8000, 0x11,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            case MP_FREQ_SCALING:
+                if (lcec_write_sdo16(slave, 0x8000, 0x13,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            case MP_PERIOD_SCALING:
+                if (lcec_write_sdo16(slave, 0x8000, 0x14,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            case MP_FREQ_RESOLUTION:
+                if (lcec_write_sdo16(slave, 0x8000, 0x15,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            case MP_PERIOD_RESOLUTION:
+                if (lcec_write_sdo16(slave, 0x8000, 0x16,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            case MP_WAIT_TIME:
+                if (lcec_write_sdo16(slave, 0x8000, 0x17,
+                                      (uint16_t)p->value.u32) != 0) goto sdo_err;
+                break;
+            default:
+                rtapi_print_msg(RTAPI_MSG_ERR,
+                    LCEC_MSG_PFX "EP5101 %s.%s: unknown modparam id %d\n",
+                    master->name, slave->name, p->id);
+                return -1;
+        }
+    }
+    return 0;
+
+sdo_err:
+    rtapi_print_msg(RTAPI_MSG_ERR,
+        LCEC_MSG_PFX "EP5101 %s.%s: modparam SDO write failed (id=%d, name=%s)\n",
+        master->name, slave->name, p->id, p->name);
+    return -1;
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 static int lcec_ep5101_init(int comp_id, lcec_slave_t *slave) {
     lcec_master_t      *master = slave->master;
     lcec_ep5101_data_t *hal_data;
     int err;
 
-    // Callbacks
     slave->proc_read  = lcec_ep5101_read;
     slave->proc_write = lcec_ep5101_write;
 
-    // HAL memory
     hal_data = LCEC_HAL_ALLOCATE(lcec_ep5101_data_t);
     slave->hal_data  = hal_data;
-
-    // PDO sync manager configuration (0x1A01 / 0x1601)
     slave->sync_info = lcec_ep5101_syncs;
 
-    // ── SDO startup sequence ─────────────────────────────────────────────────
-    //
-    // Switch SM2 RxPDO assignment to 0x1601 "ENC Control" (6 bytes)
-    // "Enable PDO Assign: yes" allows reassignment via SDO
-    lcec_write_sdo8 (slave, 0x1C12, 0x00, 0x00);    // clear assignment
-    lcec_write_sdo16(slave, 0x1C12, 0x01, 0x1601);   // assign 0x1601
-    lcec_write_sdo8 (slave, 0x1C12, 0x00, 0x01);     // count = 1
+    // ── PDO assignment SDOs ──────────────────────────────────────────────────
+    // SM2 → 0x1601 "ENC Control"
+    lcec_write_sdo8 (slave, 0x1C12, 0x00, 0x00);
+    lcec_write_sdo16(slave, 0x1C12, 0x01, 0x1601);
+    lcec_write_sdo8 (slave, 0x1C12, 0x00, 0x01);
 
-    // Switch SM3 TxPDO assignment to 0x1A01 "ENC Status" (10 bytes)
+    // SM3 → 0x1A01 "ENC Status"
     lcec_write_sdo8 (slave, 0x1C13, 0x00, 0x00);
     lcec_write_sdo16(slave, 0x1C13, 0x01, 0x1A01);
     lcec_write_sdo8 (slave, 0x1C13, 0x00, 0x01);
 
-    // ── Object 0x8000: Device configuration ─────────────────────────────────
-    lcec_write_sdo8(slave, 0x8000, 0x01, 0x01);  // Enable C reset (index pulse)
-    lcec_write_sdo8(slave, 0x8000, 0x02, 0x00);  // Disable extern reset
-    lcec_write_sdo8(slave, 0x8000, 0x03, 0x01);  // Enable up/down counter
-    lcec_write_sdo8(slave, 0x8000, 0x04, 0x00);  // Gate polarity (0 = active LOW)
-    lcec_write_sdo8(slave, 0x8000, 0x08, 0x00);  // Input filter active
-    lcec_write_sdo8(slave, 0x8000, 0x0A, 0x00);  // Normal rotation direction
+    // ── 0x8000 device config from modparams ─────────────────────────────────
+    if (lcec_ep5101_write_modparams(slave) != 0)
+        return -EIO;
 
     // ── PDO offset registration ──────────────────────────────────────────────
     lcec_pdo_init(slave, EP5101_STATUS_IDX, EP5101_STATUS_SIDX,
@@ -309,9 +418,8 @@ static int lcec_ep5101_init(int comp_id, lcec_slave_t *slave) {
         return err;
     }
 
-    // ── Defaults ─────────────────────────────────────────────────────────────
     *(hal_data->pos_scale)     = 1.0;
-    hal_data->old_scale        = 2.0;  // force scale recalc on first read
+    hal_data->old_scale        = 2.0;
     hal_data->scale            = 1.0;
     hal_data->do_init          = 1;
     hal_data->last_operational = 0;
@@ -324,32 +432,23 @@ static void lcec_ep5101_read(lcec_slave_t *slave, long period) {
     lcec_master_t      *master   = slave->master;
     lcec_ep5101_data_t *hal_data = (lcec_ep5101_data_t *)slave->hal_data;
     uint8_t            *pd       = master->process_data;
-
     uint16_t status;
-    int32_t  raw;
-    int32_t  delta;
+    int32_t  raw, delta;
 
-    // Guard: wait for OP state
     if (!slave->state.operational) {
         hal_data->last_operational = 0;
         return;
     }
 
-    // Scale change detection
     if (*(hal_data->pos_scale) != hal_data->old_scale) {
-        if (*(hal_data->pos_scale) == 0.0)
-            *(hal_data->pos_scale) = 1.0;
+        if (*(hal_data->pos_scale) == 0.0) *(hal_data->pos_scale) = 1.0;
         hal_data->scale     = 1.0 / *(hal_data->pos_scale);
         hal_data->old_scale = *(hal_data->pos_scale);
     }
 
-    // Read PDO data
-    // Status word: 16 bits little-endian at status_pdo_os
-    // status_pdo_bp = 0 because 0x6000:01 is bit 0 of byte 0
     status = EC_READ_U16(pd + hal_data->status_pdo_os);
     raw    = EC_READ_S32(pd + hal_data->count_pdo_os);
 
-    // Initialize accumulator on first operational cycle
     if (hal_data->do_init || !hal_data->last_operational) {
         hal_data->last_count = raw;
         hal_data->accum      = raw;
@@ -357,14 +456,11 @@ static void lcec_ep5101_read(lcec_slave_t *slave, long period) {
     }
     hal_data->last_operational = 1;
 
-    // Software accumulator reset (enc-reset pin)
     if (*(hal_data->reset)) {
         hal_data->accum      = 0;
         hal_data->last_count = raw;
     }
 
-    // Hardware counter preset (enc-set-raw-count pulse)
-    // Writes preset value + Set counter bit; device confirms via cnt_set_done
     if (*(hal_data->set_raw_count)) {
         *(hal_data->set_raw_count) = 0;
         hal_data->accum      = *(hal_data->set_raw_count_val);
@@ -376,35 +472,32 @@ static void lcec_ep5101_read(lcec_slave_t *slave, long period) {
                      EP5101_CTRL_SET_COUNTER);
     }
 
-    // Accumulate delta (correctly handles 32-bit hardware counter rollover)
     delta = raw - hal_data->last_count;
     hal_data->accum      += delta;
     hal_data->last_count  = raw;
 
-    // Write data output pins
     *(hal_data->status_raw) = status;
     *(hal_data->raw_count)  = raw;
     *(hal_data->count)      = (int32_t)hal_data->accum;
     *(hal_data->latch_val)  = EC_READ_S32(pd + hal_data->latch_pdo_os);
     *(hal_data->pos)        = (double)hal_data->accum * hal_data->scale;
 
-    // Write status bit pins
-    *(hal_data->latch_c_valid)   = (status & EP5101_STS_LATCH_C_VALID)   ? 1 : 0;
-    *(hal_data->latch_ext_valid) = (status & EP5101_STS_LATCH_EXT_VALID) ? 1 : 0;
-    *(hal_data->cnt_set_done)    = (status & EP5101_STS_CNT_SET_DONE)    ? 1 : 0;
-    *(hal_data->underflow)       = (status & EP5101_STS_UNDERFLOW)       ? 1 : 0;
-    *(hal_data->overflow)        = (status & EP5101_STS_OVERFLOW)        ? 1 : 0;
-    *(hal_data->input_status)    = (status & EP5101_STS_INPUT_STATUS)    ? 1 : 0;
-    *(hal_data->open_circuit)    = (status & EP5101_STS_OPEN_CIRCUIT)    ? 1 : 0;
-    *(hal_data->extrap_stall)    = (status & EP5101_STS_EXTRAP_STALL)    ? 1 : 0;
-    *(hal_data->input_a)         = (status & EP5101_STS_INPUT_A)         ? 1 : 0;
-    *(hal_data->input_b)         = (status & EP5101_STS_INPUT_B)         ? 1 : 0;
-    *(hal_data->input_c)         = (status & EP5101_STS_INPUT_C)         ? 1 : 0;
-    *(hal_data->input_gate)      = (status & EP5101_STS_INPUT_GATE)      ? 1 : 0;
-    *(hal_data->ext_latch_status)= (status & EP5101_STS_EXT_LATCH)       ? 1 : 0;
-    *(hal_data->sync_error)      = (status & EP5101_STS_SYNC_ERROR)      ? 1 : 0;
-    *(hal_data->txpdo_state)     = (status & EP5101_STS_TXPDO_STATE)     ? 1 : 0;
-    *(hal_data->txpdo_toggle)    = (status & EP5101_STS_TXPDO_TOGGLE)    ? 1 : 0;
+    *(hal_data->latch_c_valid)    = (status & EP5101_STS_LATCH_C_VALID)   ? 1 : 0;
+    *(hal_data->latch_ext_valid)  = (status & EP5101_STS_LATCH_EXT_VALID) ? 1 : 0;
+    *(hal_data->cnt_set_done)     = (status & EP5101_STS_CNT_SET_DONE)    ? 1 : 0;
+    *(hal_data->underflow)        = (status & EP5101_STS_UNDERFLOW)       ? 1 : 0;
+    *(hal_data->overflow)         = (status & EP5101_STS_OVERFLOW)        ? 1 : 0;
+    *(hal_data->input_status)     = (status & EP5101_STS_INPUT_STATUS)    ? 1 : 0;
+    *(hal_data->open_circuit)     = (status & EP5101_STS_OPEN_CIRCUIT)    ? 1 : 0;
+    *(hal_data->extrap_stall)     = (status & EP5101_STS_EXTRAP_STALL)    ? 1 : 0;
+    *(hal_data->input_a)          = (status & EP5101_STS_INPUT_A)         ? 1 : 0;
+    *(hal_data->input_b)          = (status & EP5101_STS_INPUT_B)         ? 1 : 0;
+    *(hal_data->input_c)          = (status & EP5101_STS_INPUT_C)         ? 1 : 0;
+    *(hal_data->input_gate)       = (status & EP5101_STS_INPUT_GATE)      ? 1 : 0;
+    *(hal_data->ext_latch_status) = (status & EP5101_STS_EXT_LATCH)       ? 1 : 0;
+    *(hal_data->sync_error)       = (status & EP5101_STS_SYNC_ERROR)      ? 1 : 0;
+    *(hal_data->txpdo_state)      = (status & EP5101_STS_TXPDO_STATE)     ? 1 : 0;
+    *(hal_data->txpdo_toggle)     = (status & EP5101_STS_TXPDO_TOGGLE)    ? 1 : 0;
 }
 
 // ── Write callback (realtime) ────────────────────────────────────────────────
@@ -414,21 +507,12 @@ static void lcec_ep5101_write(lcec_slave_t *slave, long period) {
     uint8_t            *pd       = master->process_data;
     uint16_t ctrl = 0;
 
-    if (!slave->state.operational)
-        return;
+    if (!slave->state.operational) return;
 
-    // Assemble 16-bit control word from HAL pins (bits 4-15 always 0)
-    if (*(hal_data->ena_latch_c))
-        ctrl |= EP5101_CTRL_ENA_LATCH_C;
-    if (*(hal_data->ena_latch_ext_pos))
-        ctrl |= EP5101_CTRL_ENA_LATCH_EXT_POS;
-    if (*(hal_data->set_counter))
-        ctrl |= EP5101_CTRL_SET_COUNTER;
-    if (*(hal_data->ena_latch_ext_neg))
-        ctrl |= EP5101_CTRL_ENA_LATCH_EXT_NEG;
+    if (*(hal_data->ena_latch_c))       ctrl |= EP5101_CTRL_ENA_LATCH_C;
+    if (*(hal_data->ena_latch_ext_pos)) ctrl |= EP5101_CTRL_ENA_LATCH_EXT_POS;
+    if (*(hal_data->set_counter))       ctrl |= EP5101_CTRL_SET_COUNTER;
+    if (*(hal_data->ena_latch_ext_neg)) ctrl |= EP5101_CTRL_ENA_LATCH_EXT_NEG;
 
     EC_WRITE_U16(pd + hal_data->ctrl_pdo_os, ctrl);
-    // Note: setcnt_pdo_os (0x7000:11) is written in the read callback
-    // when enc-set-raw-count is triggered, ensuring preset value and
-    // Set counter bit are written atomically in the same EtherCAT cycle.
 }
