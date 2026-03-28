@@ -647,10 +647,23 @@ static int lcec_danfoss_fc302_init(int comp_id, lcec_slave_t *slave) {
     hal_data->cia402 = lcec_cia402_allocate_channels(options->channels);
 
     for (int ch = 0; ch < options->channels; ch++) {
+        // lcec_cia402_register_channel() attempts an SDO upload of 0x6502
+        // (Supported Drive Modes). The FC302 MCA124 rejects this with
+        // error -5 / abort_code 0x00000000, producing two harmless but
+        // confusing error messages at every startup.
+        // Workaround: suppress all RTAPI messages during this one call,
+        // then restore the previous level immediately after.
+        // Genuine errors are still caught by the NULL-pointer check below.
+        int prev_msg_level = rtapi_get_msg_level();
+        rtapi_set_msg_level(RTAPI_MSG_NONE);
+
         hal_data->cia402->channels[ch] =
             lcec_cia402_register_channel(slave,
                                           0x6000 + 0x800 * ch,
                                           options->channel[ch]);
+
+        rtapi_set_msg_level(prev_msg_level);
+
         if (hal_data->cia402->channels[ch] == NULL) {
             rtapi_print_msg(RTAPI_MSG_ERR,
                 LCEC_MSG_PFX "lcec_cia402_register_channel failed "
