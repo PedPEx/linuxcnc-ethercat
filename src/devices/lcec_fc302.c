@@ -56,28 +56,40 @@
 /// HAL pins  (master="m0", slave="FC302")
 /// -----------------------------------------
 ///
-///   Cyclic - updated every servo cycle via PDO:
-///     lcec.m0.FC302.srv-cia-controlword   u32  IN
-///     lcec.m0.FC302.srv-cia-statusword    u32  OUT
-///     lcec.m0.FC302.srv-target-vl         s32  IN
-///     lcec.m0.FC302.srv-actual-vl         s32  OUT
+///   Cyclic – updated every servo cycle via PDO:
+///     lcec.m0.FC302.srv-cia-controlword              u32  IN
+///     lcec.m0.FC302.srv-cia-statusword               u32  OUT
+///     lcec.m0.FC302.srv-target-vl                    s32  IN
+///     lcec.m0.FC302.srv-actual-vl                    s32  OUT
+///     lcec.m0.FC302.modes-op-display                 u32  OUT  0x6061
 ///
-///   Acyclic SDO monitoring – Infos-RO group (11 objects)
-///   Startup delay 5s, then 1s cooldown between requests.
-///   All pins under  lcec.m0.FC302.Infos-RO.*
+///   Cyclic PDO monitoring (Infos-RO-PDO group):
+///     lcec.m0.FC302.Infos-RO-PDO.speed-rpm             s32  OUT  0x2651  [RPM]
+///     lcec.m0.FC302.Infos-RO-PDO.feedback-rpm          s32  OUT  0x2679  [RPM]
+///     lcec.m0.FC302.Infos-RO-PDO.power-kw              s32  OUT  0x264A  [0.01 kW]
+///     lcec.m0.FC302.Infos-RO-PDO.torque-nm             s32  OUT  0x2650  [Nm]
+///     lcec.m0.FC302.Infos-RO-PDO.torque-pct-highres    s32  OUT  0x2655  [0.1 %]
+///     lcec.m0.FC302.Infos-RO-PDO.brake-energy-avg      s32  OUT  0x2661
+///     lcec.m0.FC302.Infos-RO-PDO.dc-link-voltage       u32  OUT  0x265E  [V]
+///     lcec.m0.FC302.Infos-RO-PDO.<temp-slot>  s32/u32  OUT  PDO index from tempSlotSource
+///       Name depends on tempSlotSource modParam (FC302 par. 12-22.9):
+///         1618 → Infos-RO-PDO.motor-thermal-pct   u32 [%]
+///         1619 → Infos-RO-PDO.kty-temperature     s32 [°C]
+///         1634 → Infos-RO-PDO.heatsink-temp       s32 [°C]
+///         1635 → Infos-RO-PDO.inverter-thermal-pct u32 [%]
+///         1639 → Infos-RO-PDO.ctrl-card-temp          s32 [°C]  (default)
 ///
-///     Infos-RO.power-kw              s32  OUT  par.16-10  0x264A  [0.01 kW]
-///     Infos-RO.motor-current         s32  OUT  par.16-14  0x264E  [0.01 A]
-///     Infos-RO.dc-link-voltage       u32  OUT  par.16-30  0x265E  [V]
-///     Infos-RO.motor-thermal-pct     u32  OUT  par.16-18  0x2652  [%]
-///     Infos-RO.kty-temperature       s32  OUT  par.16-19  0x2653  [C]
-///     Infos-RO.heatsink-temp         s32  OUT  par.16-34  0x2662  [C]
-///     Infos-RO.inverter-thermal-pct  u32  OUT  par.16-35  0x2663  [%]
-///     Infos-RO.ctrl-card-temp        s32  OUT  par.16-39  0x2667  [C]
-///     Infos-RO.torque-nm             s32  OUT  par.16-16  0x2650  [Nm]
-///     Infos-RO.kwh-counter           u32  OUT  par.15-02  0x25DE  [kWh]
-///     Infos-RO.torque-pct            s32  OUT  par.16-22  0x2656  [%]
-///     Infos-RO.sdo-busy              bit  OUT  TRUE while SDO request pending
+///   Acyclic SDO monitoring – Infos-RO group (temperatures + counters)
+///   Enabled via sdoReadConfig bitmask. All pins under lcec.m0.FC302.Infos-RO.*
+///
+///     (bit 0)  Infos-RO.motor-thermal-pct    u32  0x2652  par.16-18  [%]
+///     (bit 1)  Infos-RO.kty-temperature      s32  0x2653  par.16-19  [C]
+///     (bit 2)  Infos-RO.heatsink-temp        s32  0x2662  par.16-34  [C]
+///     (bit 3)  Infos-RO.inverter-thermal-pct u32  0x2663  par.16-35  [%]
+///     (bit 4)  Infos-RO.kwh-counter          u32  0x25DE  par.15-02  [kWh]
+///     (bit 5)  Infos-RO.operating-hours      u32  0x25DC  par.15-00  [h]
+///     (bit 6)  Infos-RO.running-hours        u32  0x25DD  par.15-01  [h]
+///              Infos-RO.sdo-busy             bit  TRUE while SDO request pending
 ///
 /// modParams (SDO writes at PREOP->SAFEOP transition via startup SDO list)
 /// -----------------------------------------------------------------------
@@ -171,8 +183,11 @@
 // Danfoss digital/relay control (SDO)
 #define M_DIGITAL_RELAY_CTRL 0x0011   // 0x224E:00  u32  par. 5-90
 // Infos-RO monitoring enable bitmask
-// Each bit enables one SDO monitoring channel (see documentation below)
 #define M_SDO_READ_CONFIG    0x0012   // u32 bitmask
+// Last PDO temp slot source – FC302 par. 12-22.9 (pass as 16xx number)
+// 1618=motor-thermal-pct 1619=kty-temperature 1634=heatsink-temp
+// 1635=inverter-thermal-pct  1639=ctrl-card-temp (default)
+#define M_TEMP_SLOT_SOURCE   0x0013   // u32: FC302 par number
 
 // ---------------------------------------------------------------------------
 // modParam descriptor tables
@@ -202,9 +217,10 @@ static const lcec_modparam_desc_t modparams_perchannel[] = {
     // Infos-RO SDO monitoring enable bitmask
     // Bit 0=power-kw  1=motor-current  2=dc-link-voltage  3=motor-thermal-pct
     // Bit 4=kty-temperature  5=heatsink-temp  6=inverter-thermal-pct
-    // Bit 7=ctrl-card-temp   8=torque-nm  9=kwh-counter  10=torque-pct
+    // Bits 7-8: unused  9=kwh-counter  10=modes-op-display  11=operating-hours  12=running-hours
     // Example: 0x7FF enables all 11 channels
     {"sdoReadConfig",    M_SDO_READ_CONFIG,    MODPARAM_TYPE_U32},
+    {"tempSlotSource",   M_TEMP_SLOT_SOURCE,   MODPARAM_TYPE_U32},
     {NULL},
 };
 
@@ -248,15 +264,23 @@ static const lcec_modparam_doc_t chan_docs[] = {
     {"digitalRelayCtrl",
      "SDO 0x224E:00 (U32). FC302 par. 5-90: Digital and Relay Bus Control. "
      "Bit-coded control of digital outputs and relays via bus."},
+    {"tempSlotSource",
+     "FC302 par. 12-22.9 value (as 16xx number). Selects which temperature "
+     "sensor is mapped to the last TxPDO slot (always 16-bit). "
+     "1618=Infos-RO-PDO.motor-thermal-pct (0x2652, unsigned %) | "
+     "1619=Infos-RO-PDO.kty-temperature (0x2653, signed degC) | "
+     "1634=Infos-RO-PDO.heatsink-temp (0x2662, signed degC) | "
+     "1635=Infos-RO-PDO.inverter-thermal-pct (0x2663, unsigned %) | "
+     "1639=Infos-RO-PDO.ctrl-card-temp (0x2667, signed degC, DEFAULT). "
+     "The HAL pin name and type change accordingly. "
+     "Match this to your FC302 par. 12-22.9 setting."},
     {"sdoReadConfig",
      "Bitmask enabling Infos-RO acyclic SDO monitoring channels. "
-     "Bit 0=power-kw (0x264A) | Bit 1=motor-current (0x264E) | "
-     "Bit 2=dc-link-voltage (0x265E) | Bit 3=motor-thermal-pct (0x2652) | "
-     "Bit 4=kty-temperature (0x2653) | Bit 5=heatsink-temp (0x2662) | "
-     "Bit 6=inverter-thermal-pct (0x2663) | Bit 7=ctrl-card-temp (0x2667) | "
-     "Bit 8=torque-nm (0x2650) | Bit 9=kwh-counter (0x25DE) | "
-     "Bit 10=torque-pct (0x2656). "
-     "0=disable all (default). 0x7FF=enable all 11 channels. "
+     "Bit 0=motor-thermal-pct (0x2652) | Bit 1=kty-temperature (0x2653) | "
+     "Bit 2=heatsink-temp (0x2662) | Bit 3=inverter-thermal-pct (0x2663) | "
+     "Bit 4=kwh-counter (0x25DE) | Bit 5=operating-hours (0x25DC) | "
+     "Bit 6=running-hours (0x25DD). "
+     "0=disable all (default). 0x7F=enable all 7 channels. "
      "Only enabled channels get HAL pins and are polled. "
      "The Infos-RO.sdo-busy pin is only created if at least one bit is set."},
     {NULL},
@@ -308,7 +332,7 @@ typedef struct {
     hal_u32_t        *pin_u32;
 } fc302_mon_t;
 
-#define FC302_MON_COUNT      11    // number of Infos-RO channels
+#define FC302_MON_COUNT      7     // bit positions 0-6, no gaps
 // Target: 2 updates/s per OBJECT = full cycle in 500ms.
 // With 13 objects: 500ms / 13 = ~38ms per object.
 // FC302 mailbox RTT is ~30-50ms → no artificial cooldown needed.
@@ -326,6 +350,30 @@ typedef struct {
     unsigned int actual_vl_os;
     hal_s32_t *target_vl;   // srv-target-vl  s32  IN
     hal_s32_t *actual_vl;   // srv-actual-vl  s32  OUT
+
+    // PDO process data offsets – new TxPDO entries
+    unsigned int speed_rpm_os;       // 0x2651 Speed [RPM]
+    unsigned int feedback_rpm_os;    // 0x2679 Feedback [RPM]
+    unsigned int power_kw_os;        // 0x264A Power [kW]
+    unsigned int torque_nm_os;       // 0x2650 Torque [Nm]
+    unsigned int torque_pct_hr_os;   // 0x2655 Torque [%] High Res
+    unsigned int brake_energy_os;    // 0x2661 Brake Energy Avg
+    unsigned int dc_link_voltage_os; // 0x265E DC Link Voltage
+    unsigned int fc302_temp_os;      // temp slot – index depends on tempSlotSource
+
+    // HAL pin pointers for new PDO entries
+    hal_s32_t *speed_rpm;        // speed-rpm        s32 OUT
+    hal_s32_t *feedback_rpm;     // feedback-rpm     s32 OUT
+    hal_s32_t *power_kw;         // power-kw         s32 OUT
+    hal_s32_t *torque_nm;        // torque-nm        s32 OUT
+    hal_s32_t *torque_pct_hr;    // torque-pct-highres s32 OUT
+    hal_s32_t *brake_energy;     // brake-energy-avg s32 OUT
+    hal_u32_t *dc_link_voltage;  // dc-link-voltage  u32 OUT
+    // Configurable last temp slot (pin name/type set by tempSlotSource modParam)
+    hal_s32_t *temp_slot_s32;    // signed  temp slot pin (kty/heatsink/ctrl-card-temp)
+    hal_u32_t *temp_slot_u32;    // unsigned temp slot pin (motor/inverter thermal)
+    int        temp_slot_signed; // 1=signed(s32) 0=unsigned(u32)
+    int        temp_slot_par;    // FC302 par number stored by handle_modparams
 
     // Infos-RO acyclic SDO monitoring
     fc302_mon_t  mon[FC302_MON_COUNT];  // only enabled entries are used
@@ -516,6 +564,21 @@ static int handle_modparams(lcec_slave_t *slave,
                                         "digitalRelayCtrl");
                 break;
 
+            // ---- Last PDO temp slot source ----------------------------------
+            case M_TEMP_SLOT_SOURCE: {
+                uint32_t par = p->value.u32;
+                if (par != 1618 && par != 1619 && par != 1634 &&
+                    par != 1635 && par != 1639) {
+                    rtapi_print_msg(RTAPI_MSG_ERR,
+                        LCEC_MSG_PFX "FC302 %s.%s: tempSlotSource %u invalid. "
+                        "Valid: 1618 1619 1634 1635 1639\n",
+                        slave->master->name, slave->name, par);
+                    return -EINVAL;
+                }
+                ((lcec_danfoss_fc302_data_t *)slave->hal_data)->temp_slot_par = (int)par;
+                break;
+            }
+
             // ---- Infos-RO SDO monitoring bitmask ------------------------
             // Stored in slave->hal_data for use in init() after modparams.
             // We store it temporarily in mon_count (abused as u32 here).
@@ -604,6 +667,31 @@ static int lcec_danfoss_fc302_init(int comp_id, lcec_slave_t *slave) {
     }
 
     // -----------------------------------------------------------------------
+    // Resolve tempSlotSource → PDO object index for the last TxPDO slot
+    // Must be done before lcec_cia402_init_sync() / lcec_syncs_add_pdo_entry().
+    // -----------------------------------------------------------------------
+    uint16_t temp_slot_idx;
+    {
+        static const struct { int par; uint16_t idx; } ts_map[] = {
+            {1618, 0x2652},  // Motor Thermal %
+            {1619, 0x2653},  // KTY Sensor Temp
+            {1634, 0x2662},  // Heatsink Temp
+            {1635, 0x2663},  // Inverter Thermal %
+            {1639, 0x2667},  // Ctrl Card Temp (default)
+        };
+        int par = hal_data->temp_slot_par;
+        if (par == 0) par = 1639;
+        temp_slot_idx = 0x2667; // fallback
+        for (int i = 0; i < 5; i++) {
+            if (ts_map[i].par == par) { temp_slot_idx = ts_map[i].idx; break; }
+        }
+        rtapi_print_msg(RTAPI_MSG_INFO,
+            LCEC_MSG_PFX "FC302 %s.%s: temp slot PDO object = 0x%04X "
+            "(par %d)\n",
+            slave->master->name, slave->name, temp_slot_idx, par);
+    }
+
+    // -----------------------------------------------------------------------
     // Sync manager / PDO mapping
     //
     // The FC302 MCA124 supports ONLY two fixed PDO containers:
@@ -626,11 +714,20 @@ static int lcec_danfoss_fc302_init(int comp_id, lcec_slave_t *slave) {
     lcec_syncs_add_pdo_entry(syncs, 0x6040, 0x00, 16);    // ControlWord  u16
     lcec_syncs_add_pdo_entry(syncs, 0x6042, 0x00, 16);    // Target VL    s16
 
-    // SM3: exactly one TxPDO container with exactly two entries
+    // SM3: TxPDO 0x1A16 – confirmed via "ethercat pdos -p 0"
+    // Firmware updated: additional process data objects now accepted.
     lcec_syncs_add_sync(syncs, EC_DIR_INPUT, EC_WD_DISABLE);
-    lcec_syncs_add_pdo_info(syncs, FC302_TXPDO);           // 0x1A16 only
-    lcec_syncs_add_pdo_entry(syncs, 0x6041, 0x00, 16);    // StatusWord   u16
-    lcec_syncs_add_pdo_entry(syncs, 0x6044, 0x00, 16);    // Actual VL    s16
+    lcec_syncs_add_pdo_info(syncs, FC302_TXPDO);             // 0x1A16
+    lcec_syncs_add_pdo_entry(syncs, 0x6041, 0x00, 16);      // StatusWord          u16
+    lcec_syncs_add_pdo_entry(syncs, 0x6044, 0x00, 16);      // Actual VL           s16
+    lcec_syncs_add_pdo_entry(syncs, 0x2651, 0x00, 16);      // Speed [RPM]         s16
+    lcec_syncs_add_pdo_entry(syncs, 0x2679, 0x00, 16);      // Feedback [RPM]      s16
+    lcec_syncs_add_pdo_entry(syncs, 0x264A, 0x00, 16);      // Power [kW]          s16
+    lcec_syncs_add_pdo_entry(syncs, 0x2650, 0x00, 16);      // Torque [Nm]         s16
+    lcec_syncs_add_pdo_entry(syncs, 0x2655, 0x00, 16);      // Torque [%] High Res s16
+    lcec_syncs_add_pdo_entry(syncs, 0x2661, 0x00, 16);      // Brake Energy Avg    s16
+    lcec_syncs_add_pdo_entry(syncs, 0x265E, 0x00, 16);      // DC Link Voltage     u16
+    lcec_syncs_add_pdo_entry(syncs, temp_slot_idx, 0x00, 16); // temp slot (par-dependent)
 
     slave->sync_info = &syncs->syncs[0];
 
@@ -674,8 +771,84 @@ static int lcec_danfoss_fc302_init(int comp_id, lcec_slave_t *slave) {
     }
 
     // Register VL PDO entries manually (cannot use enable_vl=1, see above)
-    lcec_pdo_init(slave, 0x6042, 0x00, &hal_data->target_vl_os, NULL);
-    lcec_pdo_init(slave, 0x6044, 0x00, &hal_data->actual_vl_os, NULL);
+    lcec_pdo_init(slave, 0x6042, 0x00, &hal_data->target_vl_os,       NULL);
+    lcec_pdo_init(slave, 0x6044, 0x00, &hal_data->actual_vl_os,       NULL);
+
+    // Register new TxPDO entries
+    lcec_pdo_init(slave, 0x2651, 0x00, &hal_data->speed_rpm_os,       NULL);
+    lcec_pdo_init(slave, 0x2679, 0x00, &hal_data->feedback_rpm_os,    NULL);
+    lcec_pdo_init(slave, 0x264A, 0x00, &hal_data->power_kw_os,        NULL);
+    lcec_pdo_init(slave, 0x2650, 0x00, &hal_data->torque_nm_os,       NULL);
+    lcec_pdo_init(slave, 0x2655, 0x00, &hal_data->torque_pct_hr_os,   NULL);
+    lcec_pdo_init(slave, 0x2661, 0x00, &hal_data->brake_energy_os,    NULL);
+    lcec_pdo_init(slave, 0x265E, 0x00, &hal_data->dc_link_voltage_os, NULL);
+    lcec_pdo_init(slave, temp_slot_idx, 0x00, &hal_data->fc302_temp_os, NULL);
+
+    // Register new cyclic PDO HAL pins
+    {
+        char pname[HAL_NAME_LEN + 1];
+        const struct { void **ptr; hal_type_t type; const char *suffix; } pdo_pins[] = {
+            {(void**)&hal_data->speed_rpm,       HAL_S32, "Infos-RO-PDO.speed-rpm"},
+            {(void**)&hal_data->feedback_rpm,    HAL_S32, "Infos-RO-PDO.feedback-rpm"},
+            {(void**)&hal_data->power_kw,        HAL_S32, "Infos-RO-PDO.power-kw"},
+            {(void**)&hal_data->torque_nm,       HAL_S32, "Infos-RO-PDO.torque-nm"},
+            {(void**)&hal_data->torque_pct_hr,   HAL_S32, "Infos-RO-PDO.torque-pct-highres"},
+            {(void**)&hal_data->brake_energy,    HAL_S32, "Infos-RO-PDO.brake-energy-avg"},
+            {(void**)&hal_data->dc_link_voltage, HAL_U32, "Infos-RO-PDO.dc-link-voltage"},
+        };
+        for (int i = 0; i < 7; i++) {
+            rtapi_snprintf(pname, sizeof(pname), "%s.%s.%s.%s",
+                LCEC_MODULE_NAME, slave->master->name,
+                slave->name, pdo_pins[i].suffix);
+            if ((err = hal_pin_new(pname, pdo_pins[i].type, HAL_OUT,
+                                   pdo_pins[i].ptr, comp_id)) != 0) {
+                rtapi_print_msg(RTAPI_MSG_ERR,
+                    LCEC_MSG_PFX "Failed to create pin %s\n", pname);
+                return err;
+            }
+        }
+        // Dynamic temp-slot pin based on tempSlotSource modParam
+        {
+            // Lookup table: FC302 par → pin name, signed flag
+            static const struct {
+                int par; const char *pin; int sgn;
+            } ts[] = {
+                {1618, "Infos-RO-PDO.motor-thermal-pct",   0},
+                {1619, "Infos-RO-PDO.kty-temperature",     1},
+                {1634, "Infos-RO-PDO.heatsink-temp",       1},
+                {1635, "Infos-RO-PDO.inverter-thermal-pct",0},
+                {1639, "Infos-RO-PDO.ctrl-card-temp",          1}, // default
+            };
+            int par = hal_data->temp_slot_par;
+            if (par == 0) par = 1639; // default
+            const char *pin_name = "Infos-RO-PDO.ctrl-card-temp";
+            int sgn = 1;
+            for (int i = 0; i < 5; i++) {
+                if (ts[i].par == par) { pin_name = ts[i].pin; sgn = ts[i].sgn; break; }
+            }
+            hal_data->temp_slot_signed = sgn;
+            char pname[HAL_NAME_LEN + 1];
+            rtapi_snprintf(pname, sizeof(pname), "%s.%s.%s.%s",
+                LCEC_MODULE_NAME, slave->master->name, slave->name, pin_name);
+            if (sgn) {
+                if ((err = hal_pin_new(pname, HAL_S32, HAL_OUT,
+                                       (void **)&hal_data->temp_slot_s32, comp_id)) != 0)
+                    return err;
+                *(hal_data->temp_slot_s32) = 0;
+                hal_data->temp_slot_u32 = NULL;
+            } else {
+                if ((err = hal_pin_new(pname, HAL_U32, HAL_OUT,
+                                       (void **)&hal_data->temp_slot_u32, comp_id)) != 0)
+                    return err;
+                *(hal_data->temp_slot_u32) = 0;
+                hal_data->temp_slot_s32 = NULL;
+            }
+            rtapi_print_msg(RTAPI_MSG_INFO,
+                LCEC_MSG_PFX "FC302 %s.%s: last PDO temp slot = %s "
+                "(par %d)\n",
+                slave->master->name, slave->name, pin_name, par);
+        }
+    }
 
     // Register VL HAL pins via hal_pin_new() with pre-formatted name.
     // hal_pin_newf() is not available in this LinuxCNC build; use
@@ -714,19 +887,22 @@ static int lcec_danfoss_fc302_init(int comp_id, lcec_slave_t *slave) {
     // If no bits set: no pins, no requests, no sdo-busy pin created.
     // -----------------------------------------------------------------------
     {
-        // Full definition table (bit position = index into this array)
+        // Full definition table – bit position = index into this array.
+        // Gaps (NULL nm) are silently skipped even if the bit is set.
+        // Bit 3,4,5,6,9 = temperatures + kWh  (SDO only, not in PDO)
+        // Bit 10 = modes-of-operation-display (0x6061)
+        // Bit 11 = operating-hours (0x25DC)
+        // Bit 12 = running-hours   (0x25DD)
+        // Compact bitmask: bits 0-6 only, no gaps.
+        // sdoReadConfig = 0x7F enables all 7 channels.
         struct { uint16_t idx; uint8_t sidx; size_t sz; int sgn; const char *nm; } all[] = {
-            {0x264A, 0x00, 4, 1, "Infos-RO.power-kw"},           // bit  0  par.16-10 s32
-            {0x264E, 0x00, 4, 1, "Infos-RO.motor-current"},       // bit  1  par.16-14 s32
-            {0x265E, 0x00, 2, 0, "Infos-RO.dc-link-voltage"},     // bit  2  par.16-30 u16
-            {0x2652, 0x00, 1, 0, "Infos-RO.motor-thermal-pct"},   // bit  3  par.16-18 u8
-            {0x2653, 0x00, 2, 1, "Infos-RO.kty-temperature"},     // bit  4  par.16-19 s16
-            {0x2662, 0x00, 1, 1, "Infos-RO.heatsink-temp"},       // bit  5  par.16-34 s8
-            {0x2663, 0x00, 1, 0, "Infos-RO.inverter-thermal-pct"},// bit  6  par.16-35 u8
-            {0x2667, 0x00, 1, 1, "Infos-RO.ctrl-card-temp"},      // bit  7  par.16-39 s8
-            {0x2650, 0x00, 2, 1, "Infos-RO.torque-nm"},           // bit  8  par.16-16 s16
-            {0x25DE, 0x00, 4, 0, "Infos-RO.kwh-counter"},         // bit  9  par.15-02 u32
-            {0x2656, 0x00, 2, 1, "Infos-RO.torque-pct"},          // bit 10  par.16-22 s16
+            {0x2652, 0x00, 1, 0, "Infos-RO.motor-thermal-pct"},   // bit 0  par.16-18 u8
+            {0x2653, 0x00, 2, 1, "Infos-RO.kty-temperature"},     // bit 1  par.16-19 s16
+            {0x2662, 0x00, 1, 1, "Infos-RO.heatsink-temp"},       // bit 2  par.16-34 s8
+            {0x2663, 0x00, 1, 0, "Infos-RO.inverter-thermal-pct"},// bit 3  par.16-35 u8
+            {0x25DE, 0x00, 4, 0, "Infos-RO.kwh-counter"},         // bit 4  par.15-02 u32
+            {0x25DC, 0x00, 4, 0, "Infos-RO.operating-hours"},     // bit 5  par.15-00 u32
+            {0x25DD, 0x00, 4, 0, "Infos-RO.running-hours"},       // bit 6  par.15-01 u32
         };
 
         // Read bitmask stored temporarily in mon_count by handle_modparams
@@ -818,9 +994,24 @@ static void lcec_danfoss_fc302_read(lcec_slave_t *slave, long period) {
 
     lcec_cia402_read_all(slave, hal_data->cia402);
 
-    // Read VL actual velocity from process data
+    // Read process data
     uint8_t *pd = slave->master->process_data;
-    *(hal_data->actual_vl) = (int16_t)EC_READ_U16(&pd[hal_data->actual_vl_os]);
+    *(hal_data->actual_vl)      = (int16_t)EC_READ_U16(&pd[hal_data->actual_vl_os]);
+    *(hal_data->speed_rpm)      = (int16_t)EC_READ_U16(&pd[hal_data->speed_rpm_os]);
+    *(hal_data->feedback_rpm)   = (int16_t)EC_READ_U16(&pd[hal_data->feedback_rpm_os]);
+    *(hal_data->power_kw)       = (int16_t)EC_READ_U16(&pd[hal_data->power_kw_os]);
+    *(hal_data->torque_nm)      = (int16_t)EC_READ_U16(&pd[hal_data->torque_nm_os]);
+    *(hal_data->torque_pct_hr)  = (int16_t)EC_READ_U16(&pd[hal_data->torque_pct_hr_os]);
+    *(hal_data->brake_energy)   = (int16_t)EC_READ_U16(&pd[hal_data->brake_energy_os]);
+    *(hal_data->dc_link_voltage)= EC_READ_U16(&pd[hal_data->dc_link_voltage_os]);
+    // Configurable temp slot – pin type determined at init by tempSlotSource
+    if (hal_data->temp_slot_signed) {
+        if (hal_data->temp_slot_s32)
+            *(hal_data->temp_slot_s32) = (int16_t)EC_READ_U16(&pd[hal_data->fc302_temp_os]);
+    } else {
+        if (hal_data->temp_slot_u32)
+            *(hal_data->temp_slot_u32) = EC_READ_U16(&pd[hal_data->fc302_temp_os]);
+    }
 
     // -----------------------------------------------------------------------
     // Infos-RO acyclic SDO monitoring – round-robin with startup delay
