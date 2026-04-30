@@ -176,7 +176,7 @@ as defined in `ethercat-conf.xml`).
 | `Infos-RO-PDO.feedback-rpm` | s32 | OUT | `0x2679` | RPM |
 | `Infos-RO-PDO.power-kw` | s32 | OUT | `0x264A` | 0.01 kW/digit |
 | `Infos-RO-PDO.torque-nm` | s32 | OUT | `0x2650` | Nm |
-| `Infos-RO-PDO.torque-pct-highres` | s32 | OUT | `0x2655` | 0.01 %/digit |
+| `Infos-RO-PDO.torque-pct-highres` | s32 | OUT | `0x2655` | 0.1 %/digit |
 | `Infos-RO-PDO.brake-energy-avg` | s32 | OUT | `0x2661` | – |
 | `Infos-RO-PDO.dc-link-voltage` | u32 | OUT | `0x265E` | V |
 | `Infos-RO-PDO.<temp-slot>` | s32/u32 | OUT | `tempSlotSource` | see below |
