@@ -6,8 +6,13 @@
  * Hardware verified: Revision 0x00180000 (Rev 7), both slaves confirmed
  * identical via  ethercat slaves -v -p 6/7.
  *
- * PDO layout (Enable PDO Assign: yes, Enable PDO Configuration: no)
- * Active PDOs confirmed via  ethercat pdos -p 6:
+ * PDO layout (Enable PDO Assign: no, Enable PDO Configuration: no)
+ * The slave's PDO mapping is fixed in hardware and cannot be changed.
+ * slave->sync_info is set to NULL to suppress the IgH master's
+ * ecrt_slave_config_pdos() call, which would otherwise produce harmless
+ * but noisy dmesg WARNINGs on every PREOP→SAFEOP transition.
+ * PDO entry offsets are registered directly via lcec_pdo_init() / slave->regs.
+ * Layout confirmed via  ethercat pdos -p 6  on hardware Rev 14 / SW 07:
  *
  *  SM2 RxPDO – master → slave
  *  ┌──────────────────────────────────────────────────────────────────────┐
@@ -61,7 +66,19 @@
  *   8  Control voltage      → HAL pin chN.info-ctrl-voltage  (s32, mV)
  *   9  Motor supply voltage → HAL pin chN.info-supply-voltage(s32, mV)
  *
- * Optional cyclic SDO info data (modParam chN_enable_info_sdo = true):
+ * KNOWN HARDWARE BUG – EL7332 Rev 14 / SW 07:
+ *   9020:02 (Motor coil voltage) saturates at approximately -344 mV when the
+ *   motor runs in the negative direction. This has been reproduced identically
+ *   in TwinCAT3 and is a firmware defect in this hardware revision; it is not
+ *   a driver issue. Positive-direction voltage readings are correct.
+ *   Workaround: chN.info.coil-voltage-calc is computed each cycle as:
+ *     (duty_cycle_pct / 100.0) * supply_voltage_mV
+ *   using 9020:06 (duty cycle, INT8, %) and F900:05 (supply voltage, mV).
+ *   Both duty cycle and supply voltage are read correctly in both directions.
+ *   Note: 9020:11 / 9020:12 (info data 1/2 mirror) do not exist in this
+ *   firmware revision – the subindices are absent from the object dictionary.
+ *   The chN.info.data-1 / chN.info.data-2 pins have been removed accordingly.
+ *
  *   9020:02 / 9030:02  Motor coil voltage  → chN.sdo-coil-voltage  (s32, mV)
  *   9020:03 / 9030:03  Motor coil current  → chN.sdo-coil-current  (s32, mA)
  *   9020:05 / 9030:05  Control error       → chN.sdo-control-error (s32)
@@ -141,10 +158,6 @@
 #include "../lcec.h"
 #include <stdio.h>
 
-#ifndef ARRAY_SIZE
-#  define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-#endif
-
 /* ======================================================================
  * Vendor / Product identifiers
  * Confirmed via:  ethercat slaves -v -p 6
@@ -189,8 +202,11 @@
 #define DEF_WARNING_TEMP         80     /* °C */
 #define DEF_SWITCHOFF_TEMP       100    /* °C */
 
-/* Cyclic SDO read throttle: once per ~1 s at 1 kHz servo thread */
-#define SDO_READ_INTERVAL        1000
+/* Cyclic SDO read throttle: one request per SDO_READ_INTERVAL servo cycles.
+ * At 1 kHz servo thread this gives ~100 ms between consecutive requests.
+ * The EL7332 mailbox round-trip is typically <10 ms, so this is safe.
+ * With 23 slots (2 device + 16 diag + 5 info) all data refreshes in ~2.3 s. */
+#define SDO_READ_INTERVAL        100
 
 /* SDO data sizes */
 #define SDO_SIZE_TEMP            1      /* F900:02: INT8  */
@@ -410,10 +426,11 @@ typedef struct {
 
   /* Optional cyclic SDO requests – 9020:xx / 9030:xx info data
    * Only allocated when modParam chN_enable_info_sdo = true.
-   * HAL pin prefix: chN.info.*                                        */
-  ec_sdo_request_t *sdo_info_data_1;        /* 90N0:11 UINT16 – mirrors PDO info data 1 source */
-  ec_sdo_request_t *sdo_info_data_2;        /* 90N0:12 UINT16 – mirrors PDO info data 2 source */
-  ec_sdo_request_t *sdo_info_coil_voltage;  /* 90N0:02 UINT16 mV  */
+   * HAL pin prefix: chN.info.*
+   * NOTE: 9020:11 / 9020:12 are absent in Rev14/SW07 firmware – not requested.
+   * coil-voltage-calc is computed from duty_cycle × supply_voltage as a
+   * workaround for the hardware bug in 9020:02 (saturates at ~-344 mV).     */
+  ec_sdo_request_t *sdo_info_coil_voltage;  /* 90N0:02 UINT16 mV (pos. dir. only, see bug note) */
   ec_sdo_request_t *sdo_info_coil_current;  /* 90N0:03 INT16  mA  */
   ec_sdo_request_t *sdo_info_control_error; /* 90N0:05 INT16      */
   ec_sdo_request_t *sdo_info_duty_cycle;    /* 90N0:06 INT8   %   */
@@ -438,13 +455,12 @@ typedef struct {
   hal_bit_t   *sync_error;        /*!< 6020:0E / 6030:0E                       */
 
   /* HAL pins – HAL_OUT: optional SDO info data (chN.info.*) */
-  hal_s32_t   *info_data_1;       /*!< 90N0:11 – PDO info data 1 raw value     */
-  hal_s32_t   *info_data_2;       /*!< 90N0:12 – PDO info data 2 raw value     */
-  hal_s32_t   *info_coil_voltage;
-  hal_s32_t   *info_coil_current;
-  hal_s32_t   *info_control_error;
-  hal_s32_t   *info_duty_cycle;
-  hal_s32_t   *info_overload_time;
+  hal_s32_t   *info_coil_voltage;      /*!< 90N0:02 mV – positive direction only, see HW bug note */
+  hal_s32_t   *info_coil_voltage_calc; /*!< (duty_cycle/100) * supply_voltage – workaround        */
+  hal_s32_t   *info_coil_current;      /*!< 90N0:03 mA  */
+  hal_s32_t   *info_control_error;     /*!< 90N0:05     */
+  hal_s32_t   *info_duty_cycle;        /*!< 90N0:06 %   */
+  hal_s32_t   *info_overload_time;     /*!< 90N0:09 ms  */
 
   /* HAL pins – HAL_OUT: diagnostics from A020 / A030 (cyclic SDO) */
   hal_bit_t   *diag_saturated;
@@ -478,8 +494,13 @@ typedef struct {
   ec_sdo_request_t *sdo_internal_temp;
   ec_sdo_request_t *sdo_supply_voltage;
 
-  /* Shared SDO read throttle counter */
+  /* Shared SDO read throttle counter and serialization index.
+   * sdo_read_timer: counts servo cycles; fires when >= SDO_READ_INTERVAL.
+   * sdo_seq_index:  which request slot is currently active (round-robin).
+   * Only one SDO request is started per timer expiry to prevent mailbox
+   * collisions (abort 0x08000022 / "wrong SDO" desync on EL7332 Rev14). */
   unsigned int sdo_read_timer;
+  unsigned int sdo_seq_index;
 
   /* Device-wide HAL pins */
   hal_s32_t   *internal_temp;     /*!< F900:02 internal temperature (°C)       */
@@ -502,128 +523,6 @@ typedef struct {
  * Their entries are declared with index 0x0000 / subindex 0x00 so the IgH
  * master maps them as gaps – no lcec_pdo_init() calls are made for them.
  * ====================================================================== */
-
-/* RxPDO SM2 */
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_cnt1_entries[] = {
-  {0x0000, 0x00,  2},   /* gap: CNT compact control Ch.1 (not used) */
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  4},
-  {0x0000, 0x00,  8},
-  {0x0000, 0x00, 16},   /* set counter value */
-};
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_cnt2_entries[] = {
-  {0x0000, 0x00,  2},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  4},
-  {0x0000, 0x00,  8},
-  {0x0000, 0x00, 16},
-};
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_dcm1_ctrl_entries[] = {
-  {0x7020, 0x01,  1},   /* Enable      */
-  {0x7020, 0x02,  1},   /* Reset       */
-  {0x7020, 0x03,  1},   /* Reduce torque */
-  {0x0000, 0x00,  5},   /* gap         */
-  {0x0000, 0x00,  8},   /* gap         */
-};
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_dcm1_vel_entries[] = {
-  {0x7020, 0x21, 16},   /* Velocity (INT16) */
-};
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_dcm2_ctrl_entries[] = {
-  {0x7030, 0x01,  1},
-  {0x7030, 0x02,  1},
-  {0x7030, 0x03,  1},
-  {0x0000, 0x00,  5},
-  {0x0000, 0x00,  8},
-};
-static ec_pdo_entry_info_t lcec_el7332_rxpdo_dcm2_vel_entries[] = {
-  {0x7030, 0x21, 16},
-};
-
-/* TxPDO SM3 */
-static ec_pdo_entry_info_t lcec_el7332_txpdo_cnt1_entries[] = {
-  {0x0000, 0x00,  2},   /* gap: CNT compact status Ch.1 (not used) */
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  2},
-  {0x0000, 0x00,  5},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00, 16},   /* counter value */
-};
-static ec_pdo_entry_info_t lcec_el7332_txpdo_cnt2_entries[] = {
-  {0x0000, 0x00,  2},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  2},
-  {0x0000, 0x00,  5},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00, 16},
-};
-static ec_pdo_entry_info_t lcec_el7332_txpdo_dcm1_entries[] = {
-  {0x6020, 0x01,  1},   /* Ready to enable  */
-  {0x6020, 0x02,  1},   /* Ready            */
-  {0x6020, 0x03,  1},   /* Warning          */
-  {0x6020, 0x04,  1},   /* Error            */
-  {0x6020, 0x05,  1},   /* Moving positive  */
-  {0x6020, 0x06,  1},   /* Moving negative  */
-  {0x6020, 0x07,  1},   /* Torque reduced   */
-  {0x0000, 0x00,  1},   /* gap              */
-  {0x0000, 0x00,  3},   /* gap              */
-  {0x6020, 0x0C,  1},   /* Digital input 1  */
-  {0x6020, 0x0D,  1},   /* Digital input 2  */
-  {0x6020, 0x0E,  1},   /* Sync error       */
-  {0x0000, 0x00,  1},   /* gap              */
-  {0x6020, 0x10,  1},   /* TxPDO Toggle – hardware fixed, not exposed as HAL pin */
-};
-static ec_pdo_entry_info_t lcec_el7332_txpdo_dcm2_entries[] = {
-  {0x6030, 0x01,  1},
-  {0x6030, 0x02,  1},
-  {0x6030, 0x03,  1},
-  {0x6030, 0x04,  1},
-  {0x6030, 0x05,  1},
-  {0x6030, 0x06,  1},
-  {0x6030, 0x07,  1},
-  {0x0000, 0x00,  1},
-  {0x0000, 0x00,  3},
-  {0x6030, 0x0C,  1},
-  {0x6030, 0x0D,  1},
-  {0x6030, 0x0E,  1},
-  {0x0000, 0x00,  1},
-  {0x6030, 0x10,  1},   /* TxPDO Toggle – hardware fixed, not exposed as HAL pin */
-};
-
-static ec_pdo_info_t lcec_el7332_pdos_out[] = {
-  {0x1600, ARRAY_SIZE(lcec_el7332_rxpdo_cnt1_entries),     lcec_el7332_rxpdo_cnt1_entries},
-  {0x1602, ARRAY_SIZE(lcec_el7332_rxpdo_cnt2_entries),     lcec_el7332_rxpdo_cnt2_entries},
-  {0x1604, ARRAY_SIZE(lcec_el7332_rxpdo_dcm1_ctrl_entries),lcec_el7332_rxpdo_dcm1_ctrl_entries},
-  {0x1605, ARRAY_SIZE(lcec_el7332_rxpdo_dcm1_vel_entries), lcec_el7332_rxpdo_dcm1_vel_entries},
-  {0x1606, ARRAY_SIZE(lcec_el7332_rxpdo_dcm2_ctrl_entries),lcec_el7332_rxpdo_dcm2_ctrl_entries},
-  {0x1607, ARRAY_SIZE(lcec_el7332_rxpdo_dcm2_vel_entries), lcec_el7332_rxpdo_dcm2_vel_entries},
-};
-
-static ec_pdo_info_t lcec_el7332_pdos_in[] = {
-  {0x1A00, ARRAY_SIZE(lcec_el7332_txpdo_cnt1_entries), lcec_el7332_txpdo_cnt1_entries},
-  {0x1A02, ARRAY_SIZE(lcec_el7332_txpdo_cnt2_entries), lcec_el7332_txpdo_cnt2_entries},
-  {0x1A04, ARRAY_SIZE(lcec_el7332_txpdo_dcm1_entries), lcec_el7332_txpdo_dcm1_entries},
-  {0x1A06, ARRAY_SIZE(lcec_el7332_txpdo_dcm2_entries), lcec_el7332_txpdo_dcm2_entries},
-};
-
-static ec_sync_info_t lcec_el7332_syncs[] = {
-  {0, EC_DIR_OUTPUT, 0, NULL},
-  {1, EC_DIR_INPUT,  0, NULL},
-  {2, EC_DIR_OUTPUT, ARRAY_SIZE(lcec_el7332_pdos_out), lcec_el7332_pdos_out},
-  {3, EC_DIR_INPUT,  ARRAY_SIZE(lcec_el7332_pdos_in),  lcec_el7332_pdos_in},
-  {0xFF},
-};
 
 /* ======================================================================
  * Helper: write UINT16 SDO, warn on failure, non-fatal
@@ -765,7 +664,14 @@ static int lcec_el7332_init(int comp_id, lcec_slave_t *slave) {
 
   hal_data = LCEC_HAL_ALLOCATE(lcec_el7332_data_t);
   slave->hal_data  = hal_data;
-  slave->sync_info = lcec_el7332_syncs;
+  /* slave->sync_info is intentionally set to NULL.
+   * The EL7332 has Enable PDO Configuration: no and Enable PDO Assign: no –
+   * its PDO layout is fixed in hardware and cannot be changed.  Setting
+   * sync_info would cause the IgH master to attempt ecrt_slave_config_pdos()
+   * on every PREOP→SAFEOP transition, which the slave rejects with a harmless
+   * but noisy WARNING in dmesg.  PDO entry offsets are registered directly
+   * via lcec_pdo_init() / slave->regs, which does not require sync_info.    */
+  slave->sync_info = NULL;
 
   /* --- Collect modParam overrides --- */
   for (p = slave->modparams; p != NULL && p->id >= 0; p++) {
@@ -975,13 +881,12 @@ static int lcec_el7332_init(int comp_id, lcec_slave_t *slave) {
      * All read via SDO from 9020 / 9030; 9020:11/12 mirror the info_data
      * selection configured by modParam chN_info_data_1/2.              */
     if (c->enable_info_sdo) {
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_data_1,        "%s.%s.%s.ch%d.info.data-1",        LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_data_2,        "%s.%s.%s.ch%d.info.data-2",        LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_coil_voltage,  "%s.%s.%s.ch%d.info.coil-voltage",  LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_coil_current,  "%s.%s.%s.ch%d.info.coil-current",  LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_control_error, "%s.%s.%s.ch%d.info.control-error", LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_duty_cycle,    "%s.%s.%s.ch%d.info.duty-cycle",    LCEC_MODULE_NAME, master->name, slave->name, n);
-      PIN_NEW(HAL_S32, HAL_OUT, &c->info_overload_time, "%s.%s.%s.ch%d.info.overload-time", LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_coil_voltage,      "%s.%s.%s.ch%d.info.coil-voltage",      LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_coil_voltage_calc, "%s.%s.%s.ch%d.info.coil-voltage-calc", LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_coil_current,      "%s.%s.%s.ch%d.info.coil-current",      LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_control_error,     "%s.%s.%s.ch%d.info.control-error",     LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_duty_cycle,        "%s.%s.%s.ch%d.info.duty-cycle",        LCEC_MODULE_NAME, master->name, slave->name, n);
+      PIN_NEW(HAL_S32, HAL_OUT, &c->info_overload_time,     "%s.%s.%s.ch%d.info.overload-time",     LCEC_MODULE_NAME, master->name, slave->name, n);
     }
 
 #undef PIN_NEW
@@ -1082,89 +987,23 @@ static int lcec_el7332_init(int comp_id, lcec_slave_t *slave) {
     /* Optional 9020 / 9030 info data SDO requests */
     if (c->enable_info_sdo) {
       uint16_t info_idx = (ch == 0) ? 0x9020 : 0x9030;
-      c->sdo_info_data_1        = el7332_sdo_request(slave, info_idx, 0x11, 2);
-      c->sdo_info_data_2        = el7332_sdo_request(slave, info_idx, 0x12, 2);
+      /* NOTE: 9020:11 / 9020:12 absent in Rev14/SW07 – not requested */
       c->sdo_info_coil_voltage  = el7332_sdo_request(slave, info_idx, 0x02, 2);
       c->sdo_info_coil_current  = el7332_sdo_request(slave, info_idx, 0x03, 2);
       c->sdo_info_control_error = el7332_sdo_request(slave, info_idx, 0x05, 2);
       c->sdo_info_duty_cycle    = el7332_sdo_request(slave, info_idx, 0x06, 1);
       c->sdo_info_overload_time = el7332_sdo_request(slave, info_idx, 0x09, 2);
-      if (!c->sdo_info_data_1        || !c->sdo_info_data_2       ||
-          !c->sdo_info_coil_voltage  || !c->sdo_info_coil_current  ||
+      if (!c->sdo_info_coil_voltage  || !c->sdo_info_coil_current  ||
           !c->sdo_info_control_error || !c->sdo_info_duty_cycle     ||
           !c->sdo_info_overload_time)
         return -EIO;
     }
   }
 
-  hal_data->sdo_read_timer = 0;
+  hal_data->sdo_read_timer = SDO_READ_INTERVAL - 1;
+  hal_data->sdo_seq_index  = 0;
 
   return 0;
-}
-
-/* ======================================================================
- * Helper: process one cyclic SDO request – read and update HAL pin
- * Returns the read uint16 value via *out on success, leaves *out unchanged
- * on BUSY or ERROR.  Retries automatically on ERROR.
- * ====================================================================== */
-static void el7332_sdo_read_u16(lcec_master_t *master, lcec_slave_t *slave,
-                                  ec_sdo_request_t *req, uint16_t *out,
-                                  const char *name) {
-  switch (ecrt_sdo_request_state(req)) {
-    case EC_REQUEST_UNUSED:
-      ecrt_sdo_request_read(req);
-      break;
-    case EC_REQUEST_SUCCESS:
-      *out = EC_READ_U16(ecrt_sdo_request_data(req));
-      ecrt_sdo_request_read(req);
-      break;
-    case EC_REQUEST_BUSY:
-      break;
-    case EC_REQUEST_ERROR:
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "SDO read failed on %s for slave %s.%s – retrying\n",
-        name, master->name, slave->name);
-      ecrt_sdo_request_read(req);
-      break;
-  }
-}
-
-static void el7332_sdo_read_bool(lcec_master_t *master, lcec_slave_t *slave,
-                                  ec_sdo_request_t *req, hal_bit_t *out,
-                                  const char *name) {
-  switch (ecrt_sdo_request_state(req)) {
-    case EC_REQUEST_UNUSED:
-      ecrt_sdo_request_read(req); break;
-    case EC_REQUEST_SUCCESS:
-      *out = EC_READ_U8(ecrt_sdo_request_data(req)) ? 1 : 0;
-      ecrt_sdo_request_read(req); break;
-    case EC_REQUEST_BUSY:
-      break;
-    case EC_REQUEST_ERROR:
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "SDO read failed on %s for slave %s.%s – retrying\n",
-        name, master->name, slave->name);
-      ecrt_sdo_request_read(req); break;
-  }
-}
-
-static void el7332_sdo_read_s8(lcec_master_t *master, lcec_slave_t *slave,
-                                 ec_sdo_request_t *req, int8_t *out,
-                                 const char *name) {
-  switch (ecrt_sdo_request_state(req)) {
-    case EC_REQUEST_UNUSED:
-      ecrt_sdo_request_read(req); break;
-    case EC_REQUEST_SUCCESS:
-      *out = (int8_t)EC_READ_U8(ecrt_sdo_request_data(req));
-      ecrt_sdo_request_read(req); break;
-    case EC_REQUEST_BUSY:
-      break;
-    case EC_REQUEST_ERROR:
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "SDO read failed on %s for slave %s.%s – retrying\n",
-        name, master->name, slave->name);
-      ecrt_sdo_request_read(req); break;
-  }
 }
 
 /* ======================================================================
@@ -1196,89 +1035,135 @@ static void lcec_el7332_read(lcec_slave_t *slave, long period) {
     (void)EC_READ_BIT(pd + c->tx_toggle_os, c->tx_toggle_bp);
   }
 
-  /* --- Cyclic SDO reads – throttled to SDO_READ_INTERVAL --- */
-  if (++hal_data->sdo_read_timer >= SDO_READ_INTERVAL) {
-    hal_data->sdo_read_timer = 0;
+  /* --- Cyclic SDO reads – serialized, one request per tick.
+   *
+   * All SDO requests are collected into a flat array each cycle.
+   * sdo_read_timer counts servo cycles; when it reaches SDO_READ_INTERVAL
+   * the current slot (sdo_seq_index) is serviced and the result is stored.
+   * sdo_seq_index then advances to the next slot.  This guarantees that at
+   * most ONE SDO upload is in flight at any time, preventing mailbox
+   * collisions (EtherCAT abort 0x08000022 / "wrong SDO" desync) that occur
+   * when multiple requests are queued simultaneously on EL7332 Rev14/SW07.
+   *
+   * Slot layout (max 28 slots):
+   *   0   F900:02  internal temperature
+   *   1   F900:05  supply voltage
+   *   2   A020:01  ch1 diag saturated
+   *   3   A020:02  ch1 diag over-temp
+   *   4   A020:03  ch1 diag torque-overload
+   *   5   A020:04  ch1 diag under-voltage
+   *   6   A020:05  ch1 diag over-voltage
+   *   7   A020:06  ch1 diag short-circuit
+   *   8   A020:08  ch1 diag no-ctrl-power
+   *   9   A020:09  ch1 diag misc-error
+   *  10   A030:01  ch2 diag saturated
+   *  ...  (same pattern)
+   *  17   A030:09  ch2 diag misc-error
+   *  18+  9020:xx  ch1 info (only if enable_info_sdo)
+   *  23+  9030:xx  ch2 info (only if enable_info_sdo)
+   */
+  {
+    /* Build flat slot array – pointers only, no allocation */
+    typedef struct {
+      ec_sdo_request_t  *req;
+      volatile void     *out;  /* hal_s32_t*, hal_u32_t*, or hal_bit_t* – all volatile */
+      int                is_s8;
+      int                is_u32;
+      int                is_bool;
+    } sdo_slot_t;
 
-    /* F900:02  Internal temperature */
-    {
-      int8_t tmp = 0;
-      el7332_sdo_read_s8(master, slave, hal_data->sdo_internal_temp,
-                          &tmp, "F900:02");
-      *hal_data->internal_temp = (hal_s32_t)tmp;
-    }
+    sdo_slot_t slots[32];
+    unsigned int n = 0;
 
-    /* F900:05  Motor supply voltage */
-    {
-      uint16_t tmp = 0;
-      el7332_sdo_read_u16(master, slave, hal_data->sdo_supply_voltage,
-                           &tmp, "F900:05");
-      *hal_data->supply_voltage = (hal_u32_t)tmp;
-    }
+#define SLOT_U16(r, p)  do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=0; slots[n].is_u32=0; slots[n].is_bool=0; n++; } while(0)
+#define SLOT_S8(r, p)   do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=1; slots[n].is_u32=0; slots[n].is_bool=0; n++; } while(0)
+#define SLOT_U32(r, p)  do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=0; slots[n].is_u32=1; slots[n].is_bool=0; n++; } while(0)
+#define SLOT_BIT(r, p)  do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=0; slots[n].is_u32=0; slots[n].is_bool=1; n++; } while(0)
 
-    /* A020 / A030  DCM Diag data – 8 individual BOOLEAN SDO reads per channel */
+    SLOT_S8 (hal_data->sdo_internal_temp,         hal_data->internal_temp);
+    SLOT_U32(hal_data->sdo_supply_voltage,         hal_data->supply_voltage);
+
     for (ch = 0; ch < 2; ch++) {
-      lcec_el7332_ch_t *c   = &hal_data->ch[ch];
-      const char       *pfx = (ch == 0) ? "A020" : "A030";
-      char              name[16];
+      lcec_el7332_ch_t *c = &hal_data->ch[ch];
+      SLOT_BIT(c->sdo_diag_saturated,       c->diag_saturated);
+      SLOT_BIT(c->sdo_diag_over_temp,       c->diag_over_temp);
+      SLOT_BIT(c->sdo_diag_torque_overload, c->diag_torque_overload);
+      SLOT_BIT(c->sdo_diag_under_voltage,   c->diag_under_voltage);
+      SLOT_BIT(c->sdo_diag_over_voltage,    c->diag_over_voltage);
+      SLOT_BIT(c->sdo_diag_short_circuit,   c->diag_short_circuit);
+      SLOT_BIT(c->sdo_diag_no_ctrl_power,   c->diag_no_ctrl_power);
+      SLOT_BIT(c->sdo_diag_misc_error,      c->diag_misc_error);
+    }
 
-      snprintf(name, sizeof(name), "%s:01", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_saturated,       c->diag_saturated,       name);
-      snprintf(name, sizeof(name), "%s:02", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_over_temp,       c->diag_over_temp,       name);
-      snprintf(name, sizeof(name), "%s:03", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_torque_overload, c->diag_torque_overload, name);
-      snprintf(name, sizeof(name), "%s:04", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_under_voltage,   c->diag_under_voltage,   name);
-      snprintf(name, sizeof(name), "%s:05", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_over_voltage,    c->diag_over_voltage,    name);
-      snprintf(name, sizeof(name), "%s:06", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_short_circuit,   c->diag_short_circuit,   name);
-      snprintf(name, sizeof(name), "%s:08", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_no_ctrl_power,   c->diag_no_ctrl_power,   name);
-      snprintf(name, sizeof(name), "%s:09", pfx);
-      el7332_sdo_read_bool(master, slave, c->sdo_diag_misc_error,      c->diag_misc_error,      name);
-
-      /* Optional 9020 / 9030 info data SDO reads (chN.info.*) */
+    for (ch = 0; ch < 2; ch++) {
+      lcec_el7332_ch_t *c = &hal_data->ch[ch];
       if (c->enable_info_sdo) {
-        const char *ipfx = (ch == 0) ? "9020" : "9030";
-        uint16_t u16tmp;
-        int8_t   s8tmp;
+        SLOT_U16(c->sdo_info_coil_voltage,  c->info_coil_voltage);
+        SLOT_U16(c->sdo_info_coil_current,  c->info_coil_current);
+        SLOT_U16(c->sdo_info_control_error, c->info_control_error);
+        SLOT_S8 (c->sdo_info_duty_cycle,    c->info_duty_cycle);
+        SLOT_U16(c->sdo_info_overload_time, c->info_overload_time);
+      }
+    }
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:11", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_data_1, &u16tmp, name);
-        *c->info_data_1 = (hal_s32_t)(int16_t)u16tmp;
+#undef SLOT_U16
+#undef SLOT_S8
+#undef SLOT_U32
+#undef SLOT_BIT
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:12", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_data_2, &u16tmp, name);
-        *c->info_data_2 = (hal_s32_t)(int16_t)u16tmp;
+    /* Wrap sequence index */
+    if (hal_data->sdo_seq_index >= n)
+      hal_data->sdo_seq_index = 0;
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:02", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_coil_voltage, &u16tmp, name);
-        *c->info_coil_voltage = (hal_s32_t)(int16_t)u16tmp;
+    if (++hal_data->sdo_read_timer >= SDO_READ_INTERVAL) {
+      hal_data->sdo_read_timer = 0;
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:03", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_coil_current, &u16tmp, name);
-        *c->info_coil_current = (hal_s32_t)(int16_t)u16tmp;
+      /* Service exactly one slot */
+      sdo_slot_t *s = &slots[hal_data->sdo_seq_index];
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:05", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_control_error, &u16tmp, name);
-        *c->info_control_error = (hal_s32_t)(int16_t)u16tmp;
+      switch (ecrt_sdo_request_state(s->req)) {
+        case EC_REQUEST_UNUSED:
+          ecrt_sdo_request_read(s->req);
+          break;
 
-        s8tmp = 0;
-        snprintf(name, sizeof(name), "%s:06", ipfx);
-        el7332_sdo_read_s8(master, slave, c->sdo_info_duty_cycle, &s8tmp, name);
-        *c->info_duty_cycle = (hal_s32_t)s8tmp;
+        case EC_REQUEST_SUCCESS:
+          if (s->is_bool) {
+            *(volatile hal_bit_t *)s->out = EC_READ_U8(ecrt_sdo_request_data(s->req)) ? 1 : 0;
+          } else if (s->is_s8) {
+            *(volatile hal_s32_t *)s->out = (hal_s32_t)(int8_t)EC_READ_U8(ecrt_sdo_request_data(s->req));
+          } else if (s->is_u32) {
+            *(volatile hal_u32_t *)s->out = (hal_u32_t)EC_READ_U16(ecrt_sdo_request_data(s->req));
+          } else {
+            *(volatile hal_s32_t *)s->out = (hal_s32_t)(int16_t)EC_READ_U16(ecrt_sdo_request_data(s->req));
+          }
+          /* Advance to next slot and immediately kick off its read */
+          hal_data->sdo_seq_index = (hal_data->sdo_seq_index + 1) % n;
+          ecrt_sdo_request_read(slots[hal_data->sdo_seq_index].req);
+          break;
 
-        u16tmp = 0;
-        snprintf(name, sizeof(name), "%s:09", ipfx);
-        el7332_sdo_read_u16(master, slave, c->sdo_info_overload_time, &u16tmp, name);
-        *c->info_overload_time = (hal_s32_t)u16tmp;
+        case EC_REQUEST_BUSY:
+          /* Still waiting – do not advance, do not reset timer */
+          hal_data->sdo_read_timer = SDO_READ_INTERVAL; /* re-fire next cycle */
+          break;
+
+        case EC_REQUEST_ERROR:
+          rtapi_print_msg(RTAPI_MSG_WARN,
+            LCEC_MSG_PFX "SDO read slot %u failed for slave %s.%s – skipping\n",
+            hal_data->sdo_seq_index, master->name, slave->name);
+          /* Advance past failed slot to avoid permanent stall */
+          hal_data->sdo_seq_index = (hal_data->sdo_seq_index + 1) % n;
+          ecrt_sdo_request_read(slots[hal_data->sdo_seq_index].req);
+          break;
+      }
+    }
+
+    /* Update coil-voltage-calc for any channel with info SDO enabled.
+     * Uses the most recently read supply_voltage and duty_cycle values.  */
+    for (ch = 0; ch < 2; ch++) {
+      lcec_el7332_ch_t *c = &hal_data->ch[ch];
+      if (c->enable_info_sdo) {
+        *c->info_coil_voltage_calc =
+          (hal_s32_t)((*c->info_duty_cycle * (hal_s32_t)*hal_data->supply_voltage) / 100);
       }
     }
   }
