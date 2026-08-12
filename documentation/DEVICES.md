@@ -95,6 +95,7 @@ Description | Driver | EtherCAT VID:PID | Device Type | Testing Status | Notes
 [Beckhoff EL2124 4Ch. Dig. Output 5V, 20mA](http://www.beckhoff.com/EL2124) | [el2xxx](../src/devices/lcec_el2xxx.c) | 0x2:0x084c3052 | Digital Output |  | 
 [Beckhoff EL2202 2Ch. Dig. Output 24V, 0.5A, DC Sync](http://www.beckhoff.com/EL2202) | [el2202](../src/devices/lcec_el2202.c) | 0x2:0x089a3052 | Digital Output |  | 
 [Beckhoff EL2521 1Ch. Pulse Train Output](http://www.beckhoff.com/EL2521) | [el2521](../src/devices/lcec_el2521.c) | 0x2:0x09d93052 | Digital Output |  | 
+[Beckhoff EL2564 4Ch. LED output, 5…48 V DC, 4 A, RGBW, common anode](http://www.beckhoff.com/EL2564) | [el2564](../src/devices/lcec_el2564.c) | 0x2:0x0a043052 | Digital Output Terminals | Tested and working @mintracer and @medikusDKFZ, gamma / ramp-time / PWM frequency are configured via driver
 [Beckhoff EL2612 2Ch. Relay Output, CO (125V AC / 30V DC)](http://www.beckhoff.com/EL2612) | [el2xxx](../src/devices/lcec_el2xxx.c) | 0x2:0x0a343052 | Digital Output |  | 
 [Beckhoff EL2622 2Ch. Relay Output, NO (230V AC / 30V DC)](http://www.beckhoff.com/EL2622) | [el2xxx](../src/devices/lcec_el2xxx.c) | 0x2:0x0a3e3052 | Digital Output |  | 
 [Beckhoff EL2624 4Ch. Relay Output, NO (125V AC / 30V DC)](http://www.beckhoff.com/EL2624) | [el2xxx](../devices/lcec_el2xxx.c) | 0x2:0x0a403052 | Digital Output |  | 
@@ -188,6 +189,7 @@ Description | Driver | EtherCAT VID:PID | Device Type | Testing Status | Notes
 [Beckhoff EL7031 1Ch. Stepper motor output stage (24V, 1.5A)](http://www.beckhoff.com/EL7031) | [el70x1](../src/devices/lcec_el70x1.c) | 0x2:0x1b773052 | Stepper Drive |  | 
 [Beckhoff EL7041 1Ch. Stepper motor output stage (50V, 5A)](http://www.beckhoff.com/EL7041) | [el70x1](../src/devices/lcec_el70x1.c) | 0x2:0x1b813052 | Stepper Drive |  | 
 [Beckhoff EL7041 1Ch. Stepper motor output stage (50V, 5A)](http://www.beckhoff.com/EL7041) | [el7041](../src/devices/lcec_el7041.c) | 0x2:0x1b813052 | Stepper Drive |  | 
+[Beckhoff EL7041 1Ch. Stepper motor output stage (50V, 5A)](http://www.beckhoff.com/EL7041) | [el7041](../src/devices/lcec_el7041.c) | 0x2:0x1b813052 | Stepper Drive |  | 
 [Beckhoff EL7201 1Ch. MDP742 Servo motor output stage (50V, 4A)](http://www.beckhoff.com/EL7201) | [el7211](../src/devices/lcec_el7211.c) | 0x2:0x1c213052 | Servo Drive |  | 
 [Beckhoff EL7211 1Ch. MDP742 Servo motor output stage (50V, 4.5A RMS)](http://www.beckhoff.com/EL7211) | [el7211](../src/devices/lcec_el7211.c) | 0x2:0x1c2b3052 | Servo Drive |  | 
 [Beckhoff EL7221 1Ch. MDP742 Servo motor output stage (50V, 8A RMS)](http://www.beckhoff.com/EL7211) | [el7211](../src/devices/lcec_el7211.c) | 0x2:0x1c353052 | Servo Drive |  | 
@@ -210,6 +212,7 @@ Description | Driver | EtherCAT VID:PID | Device Type | Testing Status | Notes
 [Beckhoff EP1008-0001 8 Ch. Dig. Input 24V, 3ms, M8](https://www.beckhoff.com/EP1008-0001) | [el1xxx](../src/devices/lcec_el1xxx.c) | 0x2:0x03f04052 | Digital Input | Uncertain; @scottlaird has several | 
 [Beckhoff EP1018-0001 8 Ch. Dig. Input 24V, 10µs, M8](https://www.beckhoff.com/EP1018-0001) | [el1xxx](../src/devices/lcec_el1xxx.c) | 0x2:0x03fa4052 | Digital Input | Uncertain; @scottlaird has several | 
 [Beckhoff EP1122-0001 2 port EtherCAT junction](https://www.beckhoff.com/EP1122-0001) | [passive](../src/devices/lcec_passive.c) | 0x2:0x04624052 | System Terminals |  | Passive device
+[EP1809-0021 | EtherCAT Box, 16-channel digital input, 24 V DC, 3 ms, M8](https://www.beckhoff.com/EP1809) | [el1xxx](../src/devices/lcec_el1xxx.c) | 0x2:0x07114052 | Digital Input | tested and working @mintracer | 
 [Beckhoff EP1819-0005 16 Ch. Dig. Input 24V, 10µs, M8 4pol](https://www.beckhoff.com/EP1819) | [el1xxx](../src/devices/lcec_el1xxx.c) | 0x2:0x071b4052 | Digital Input |  | 
 [Beckhoff EP2008-0001 8 Ch. Dig. Output 24V, 0,5A, M8](https://www.beckhoff.com/EP2008-0001) | [el2xxx](../src/devices/lcec_el2xxx.c) | 0x2:0x07d84052 | Digital Output |  | 
 [Beckhoff EP2028-0001 8 Ch. Dig. Output 24V, 2A, M8](https://www.beckhoff.com/EP2028-0001) | [el2xxx](../src/devices/lcec_el2xxx.c) | 0x2:0x07ec4052 | Digital Output |  | 
@@ -242,6 +245,8 @@ Description | Driver | EtherCAT VID:PID | Device Type | Testing Status | Notes
 [SMC EX260-SEC4](https://www.smcpneumatics.com/EX260-SEC4.html) | [ex260](../src/devices/lcec_ex260.c) | 0x114:0x01000004 | Valve Controller | Merged 2023-12-31, untested | by @satiowadahc
 [AB&T EasyIO 16 din, 16 dout, 4 ain, 2 aout module](https://www.bausano.net/en/hardware/easyio.html) | [easyio](../devices/lcec_easyio.c) | 0x79a:0x0debacca | Analog/Digital Combo | COMPLETELY UNTESTED.  Written without hardware. | 
 [AB&T EpoCAT FR4000](https://www.bausano.net/en/hardware/epocat-fr-1000.html) | [epocat](../src/devices/lcec_epocat.c) | 0x79a:0x00decade | Stepper Drive | Merged 2023-12-31, untested | by @abausano
+Lichuan OL57E-4A 4-axis open-loop stepper drive | [lichuan](../src/devices/lcec_lichuan.c) | 0xa79:0x00006000 | Stepper Drive | Untested, awaiting bench validation by @rodw-au (issue #474) | 4 axes via CiA 402 multiaxis pattern (SDO offset 0x800, PDO index increment 0x10).
+Lichuan CL57E-4A 4-axis closed-loop stepper drive | [lichuan](../src/devices/lcec_lichuan.c) | 0xa79:0x00006100 | Stepper Drive | Untested, config shared by Dil300 on linuxcnc.org forum (post 346506) | 4 axes via CiA 402 multiaxis pattern. Closed-loop variant exposes 0x6077 Torque Actual.
 [Omron MX2 VFD](https://www.ia.omron.com/data_pdf/cat/mx2-v1_i920-e1_14_16_csm1010813.pdf?id=3164) | [ommx2](../devices/lcec_ommx2.c) | 0x83:0x00000053 | VFD |  | 
 [Omron R88D-KN01H-ECT G5 Series ServoDrive/Motor](http://www.ia.omron.com/) | [omrg5](../src/devices/lcec_omrg5.c) | 0x83:0x00000005 | Servo Drive |  | 
 [Omron R88D-KN01L-ECT G5 Series ServoDrive/Motor](http://www.ia.omron.com/) | [omrg5](../src/devices/lcec_omrg5.c) | 0x83:0x00000002 | Servo Drive |  | 
@@ -269,6 +274,6 @@ Description | Driver | EtherCAT VID:PID | Device Type | Testing Status | Notes
 [Stoeber Posidrive MDS 5000](https://www.ethercat.org/en/products/CE4C65D2ED8B4F39A8166D6CEDB2C872.htm) | [stmds5k](../src/devices/lcec_stmds5k.c) | 0xb9:0x00001388 | Servo Drive |  | 
 Driver for generic CiA 402 hardware without a dedicated driver | [basic_cia402](../devices/lcec_basic_cia402.c) | 0xffffffff:0xffffffff | Motion Controller |  | 
 
-There are an additional 4 device(s) supported that do not have enough
+There are an additional 3 device(s) supported that do not have enough
 documentation to display here.  Please look at the `documentation/devices/` files
 and update them if you're able.

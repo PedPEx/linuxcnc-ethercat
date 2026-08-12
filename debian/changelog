@@ -1,3 +1,120 @@
+linuxcnc-ethercat (1.42.2-1) unstable; urgency=low
+
+  * fix(main): fold pll_err into [-period/2, period/2) in the
+    master-to-reference branch as well; the resync correction now
+    removes only whole periods, so a partially-synchronised slave no
+    longer sees a full-period phase jump. The fold is stepped twice
+    on the startup cycle where pll_err spans two periods.
+  * fix(cia402): 0x6077 actual torque is 16 bits, not 32.
+  * fix(cia402): swPositionLimitMax writes 0x607D:02, not 0x607D:01.
+  * docs: update DEVICES.md.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Tue, 04 Aug 2026 15:28:54 +0800
+
+linuxcnc-ethercat (1.42.1-1) unstable; urgency=low
+
+  * fix(main): skip the DC reference-clock read when the master runs
+    free. The ioctl fails there and the IgH library prints the failure
+    to stderr from the cyclic thread, which can block for milliseconds
+    when stderr sits on a writeback filesystem. pll-err now reads 0 in
+    free-running mode (the previous value compared against an
+    unsynchronised clock and never reached the control path).
+  * docs: warn against installing with a pending kernel update.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Thu, 30 Jul 2026 11:21:19 +0800
+
+linuxcnc-ethercat (1.42.0-1) unstable; urgency=low
+
+  * feat(main): add domain WKC monitoring pins to the master
+    (wkc, wkc-min, wkc-change-count, wkc-state, wkc-reset) and DC
+    synchrony monitoring pins (dc-sync-diff, dc-sync-converged,
+    dc-sync-max, dc-sync-monitor), with invalidation of the DC-sync
+    pins on communication loss.
+  * docs: document the master WKC and DC synchrony monitoring pins.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Tue, 21 Jul 2026 15:50:00 +0800
+
+linuxcnc-ethercat (1.41.2-1) unstable; urgency=low
+
+  * fix(syncs): bounds-check the dynamic PDO layout and report an
+    overflow instead of writing past the sync-manager buffer.
+  * fix(main): guard lcec_read_master against being called before the
+    master is activated, avoiding a crash on early reads.
+  * ci: bump the GitHub Actions runners to the Node 24 releases.
+  * ci: pull libethercat-dev from our own apt repo
+    (linuxcnc-ethercat.github.io/apt) instead of the OpenSUSE
+    science:/EtherLab builds, removing an out-of-our-control build
+    dependency.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Fri, 10 Jul 2026 10:48:07 +0800
+
+linuxcnc-ethercat (1.41.1-3) unstable; urgency=low
+
+  * ci/release: build the trixie package against Debian main's
+    linuxcnc-uspace (1:2.9.4) instead of linuxcnc.org's 1:2.9.8.
+    dpkg-shlibdeps takes the dependency floor from the build
+    environment, so the deb13 package required
+    linuxcnc-uspace (>= 1:2.9.8) and was uninstallable on stock
+    Debian trixie, where main only carries 1:2.9.4-2. The new
+    >= 1:2.9.4 floor is satisfiable both from Debian main and
+    from linuxcnc.org. Bullseye and bookworm keep building
+    against linuxcnc.org (Debian 11 has no linuxcnc; Debian 12
+    only a 2.9.0~pre1 snapshot).
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Thu, 11 Jun 2026 13:00:00 +0200
+
+linuxcnc-ethercat (1.41.1-2) unstable; urgency=low
+
+  * shlibs.local: drop ethercat-master from the libethercat.so.1
+    alternatives. ethercat-master ships only the master daemon and
+    CLI tools, no shared library, so apt treated the OR-dependency
+    as satisfied on systems that already had ethercat-master
+    installed and never pulled in libethercat. lcec_configgen (and
+    anything else linked against libethercat.so.1) then failed to
+    start. The runtime library dependency now resolves to
+    libethercat or etherlabmaster only; the ethercat CLI is still
+    covered by the explicit etherlabmaster | ethercat-master
+    dependency in debian/control.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Thu, 11 Jun 2026 12:00:00 +0200
+
+linuxcnc-ethercat (1.41.1-1) unstable; urgency=low
+
+  * Bump upstream to 1.41.1 to overtake the bad 1.41.0+debNNu1
+    pool versions that were published before release.yml was
+    fixed to read the version from debian/changelog. dpkg
+    parsed those as upstream='1.41.0+debNNu1' with no debian
+    revision, so any 1.41.0-N+debNNu1 build sorted lower and
+    apt refused to upgrade systems still running the bad build.
+    1.41.1-1 is unambiguously higher and triggers a clean
+    apt upgrade.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Tue, 19 May 2026 09:00:00 +0200
+
+linuxcnc-ethercat (1.41.0-2) unstable; urgency=low
+
+  * shlibs.local: list libethercat first in the alternatives chain
+    for libethercat.so.1. The previous order let apt resolve the
+    runtime dep to ethercat-master (which ships only the master
+    daemon, no .so), so a clean install of linuxcnc-ethercat could
+    leave lcec.so unable to load at runtime.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Mon, 18 May 2026 22:00:00 +0200
+
+linuxcnc-ethercat (1.41.0-1) unstable; urgency=low
+
+  * Drop the -bb/-pi flavor split: bb is now the canonical driver.
+    Rename source and binary package back to linuxcnc-ethercat.
+    Conflicts/Replaces/Provides arranged so any installed
+    linuxcnc-ethercat-bb or -pi migrates cleanly.
+  * Add HAL initf activation path (clean DC SYNC0 phasing on
+    LinuxCNC master/2.10 builds; legacy BANG-BANG retained as
+    fallback when initf is not registered or unavailable).
+  * Build matrix .deb packages on Debian 11/12/13 and publish to
+    linuxcnc-ethercat/apt on tagged releases.
+
+ -- Luca Toniolo <toniolo.luca@gmail.com>  Tue, 12 May 2026 12:00:00 +0200
+
 linuxcnc-ethercat-bb (1.41.0~pre5-bb1) unstable; urgency=low
 
   * Rename source/binary package to linuxcnc-ethercat-bb to ship in

@@ -50,12 +50,13 @@ and some of which are required:
   listed; systems with multiple masters will have sections labeled
   `Master0`, `Master1`, and so forth.
 - `name="<name>"`: (optional, defaults to `idx`) the name of the master.
-- `appTimePeriod="<time>"`: (required) how frequently EtherCAT masters are
-  updated, in nanoseconds.  This should match the period set on the
-  servo thread in the LinuxCNC `.hal` files.  This is frequently set
-  to 1,000,000 (without commas), giving a 1 ms cycle time.  If this
-  does not match the servo thread time, then an error will be
-  reported, eventually.
+- `appTimePeriod="<time>"`: (optional, defaults to 1,000,000 = 1 ms) how
+  frequently EtherCAT masters are updated, in nanoseconds.  This should
+  match the period set on the servo thread in the LinuxCNC `.hal` files.
+  If this does not match the servo thread period, an error is logged at
+  the first servo cycle.  Omitting this attribute uses the 1 ms default
+  and the value is replaced at runtime with the actual HAL servo
+  period when they differ.
 - `refClockSyncCycles="<n>"`: (required) selects the distributed-clock
   sync mode. The sign picks the direction; the magnitude is the
   number of servo cycles between syncs.
@@ -98,6 +99,13 @@ device:
 - `name="<name>"`: (optional but strongly recommended, defaults to the
   value of `idx`): The name of the device.  This is used in naming HAL
   pins in LinuxCNC.
+- `syncUnit="<name>"`: (optional, defaults to `default`): Places the slave
+  in a named process-data Sync Unit. Each Sync Unit owns a separate EtherCAT
+  domain. Slaves with the same Sync Unit name must use the same cycle.
+- `syncUnitCycle="<time|*N>"`: (optional, defaults to the master cycle):
+  Process-data exchange period for this Sync Unit. It must be a positive
+  integer multiple of the master's `appTimePeriod`; for example, `*2` means
+  every second master cycle.
 -  `vid="<vid>"`: (required for generic, usable but not recommended for others): the Vendor ID for the
    device.  You can determine this via `ethercat slaves -v`.
 - `pid="<pid>"`: (required for generic, usable but not recommended for others): the product ID for the

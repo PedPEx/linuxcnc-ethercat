@@ -9,51 +9,209 @@ permissions:
     contents: write
 
 jobs:
-    build-and-release:
+    build:
+        name: ${{ matrix.distro }}${{ matrix.hal_api == 'next' && ' (HAL next)' || '' }}
         runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                distro: [debian-11, debian-12, debian-13]
+                hal_api: [legacy, next]
+                exclude:
+                    # linuxcnc master needs a C++20 compiler; bullseye's
+                    # gcc 10 fails configure. No bullseye system will ever
+                    # run new-API linuxcnc, so a +getset deb is useless
+                    # there - bullseye stays legacy-only.
+                    - distro: debian-11
+                      hal_api: next
+                include:
+                    # hal_api=legacy: build against 2.9-era HAL headers
+                    # (linuxcnc-uspace-dev from the repos). Covers 2.9.x and
+                    # pre-break 2.10.
+                    #
+                    # hal_api=next: build against linuxcnc master compiled
+                    # from source (new HAL getter/setter API). The produced
+                    # deb gets a +getset version suffix (sorts above the
+                    # plain build of the same base) and a shlibs-derived
+                    # Depends: linuxcnc-uspace (>= 1:2.10~) that is
+                    # unsatisfiable on 2.9-era systems, so apt auto-selects
+                    # the right flavor per system. No public repo ships
+                    # linuxcnc 2.10 debs yet, hence the source build.
+                    #
+                    # linuxcnc_org_repo: build against linuxcnc.org's
+                    # linuxcnc-uspace-dev instead of Debian main. Needed on
+                    # bullseye (no linuxcnc in Debian 11) and bookworm (only
+                    # a 2023 2.9.0~pre1 snapshot). Trixie builds against
+                    # Debian's own 1:2.9.4 so the generated shlibs dep is
+                    # installable on stock Debian without third-party repos.
+                    - distro: debian-11
+                      image: debian:bullseye
+                      codename: bullseye
+                      deb_rev: deb11u1
+                      linuxcnc_org_repo: true
+                    - distro: debian-12
+                      image: debian:bookworm
+                      codename: bookworm
+                      deb_rev: deb12u1
+                      linuxcnc_org_repo: true
+                    - distro: debian-13
+                      image: debian:trixie
+                      codename: trixie
+                      deb_rev: deb13u1
+                      linuxcnc_org_repo: false
+
         container:
-            image: debian:trixie
+            image: ${{ matrix.image }}
+
         steps:
             - name: Install build dependencies
+              env:
+                  DEBIAN_FRONTEND: noninteractive
+                  CODENAME: ${{ matrix.codename }}
+                  LINUXCNC_ORG_REPO: ${{ matrix.linuxcnc_org_repo }}
+                  HAL_API: ${{ matrix.hal_api }}
               run: |
+                  set -e
+                  echo 'Acquire::Retries "10";' > /etc/apt/apt.conf.d/80-retries
+                  echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries
                   apt-get update
                   apt-get install -y --no-install-recommends ca-certificates curl gpg
-                  curl -fsSL https://download.opensuse.org/repositories/science:/EtherLab/Debian_Testing/Release.key \
-                      | gpg --dearmor -o /usr/share/keyrings/etherlab.gpg
-                  echo "deb [signed-by=/usr/share/keyrings/etherlab.gpg] https://download.opensuse.org/repositories/science:/EtherLab/Debian_Testing/ ./" \
-                      > /etc/apt/sources.list.d/etherlab.list
+                  # EtherCAT (libethercat-dev) comes from our own apt repo
+                  # instead of the OpenSUSE science:/EtherLab builds.
+                  curl -fsSL "https://linuxcnc-ethercat.github.io/apt/linuxcnc-ethercat-apt.gpg" \
+                      -o /usr/share/keyrings/linuxcnc-ethercat-apt.gpg
+                  echo "deb [signed-by=/usr/share/keyrings/linuxcnc-ethercat-apt.gpg] https://linuxcnc-ethercat.github.io/apt/ ${CODENAME} main" \
+                      > /etc/apt/sources.list.d/linuxcnc-ethercat.list
+                  if [ "${HAL_API}" = "legacy" ] && [ "${LINUXCNC_ORG_REPO}" = "true" ]; then
+                      # Two LinuxCNC signing keys are in use:
+                      # - 3CB9FD148F374FEF: old DSA key, signs bullseye/bookworm
+                      # - E43B5A8E78CC2927: 2025-10 RSA key, signs trixie
+                      { curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xEEDD0D29F81DCAA0D258661F3CB9FD148F374FEF"; \
+                        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x0CE3E44425B11F871BBCC6F5E43B5A8E78CC2927"; } \
+                          | gpg --dearmor -o /usr/share/keyrings/linuxcnc.gpg
+                      echo "deb [signed-by=/usr/share/keyrings/linuxcnc.gpg] https://www.linuxcnc.org/ ${CODENAME} base 2.9-uspace" \
+                          > /etc/apt/sources.list.d/linuxcnc.list
+                  fi
                   apt-get update
                   apt-get install -y --no-install-recommends \
                       git build-essential devscripts debhelper \
-                      linuxcnc-uspace-dev libethercat-dev \
-                      yapps2
+                      libethercat-dev libexpat1-dev yapps2
+                  if [ "${HAL_API}" = "legacy" ]; then
+                      apt-get install -y --no-install-recommends linuxcnc-uspace-dev
+                  fi
 
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v5
               with:
                   fetch-depth: 0
 
-            - name: Set version from git tag
+            - name: Mark repo as safe (container runs as root)
+              run: git config --global --add safe.directory "$PWD"
+
+            - name: Build and install linuxcnc master
+              if: matrix.hal_api == 'next'
+              uses: ./.github/actions/linuxcnc-master-debs
+              with:
+                  codename: ${{ matrix.codename }}
+                  distro: ${{ matrix.distro }}
+
+            - name: Stamp version with codename suffix
+              env:
+                  HAL_API: ${{ matrix.hal_api }}
               run: |
-                  VERSION="${GITHUB_REF_NAME#v}"
-                  dch --newversion "${VERSION}" --distribution stable "Release ${VERSION}"
+                  # Read the canonical version from debian/changelog so the
+                  # codename suffix lands in the Debian revision (e.g.
+                  # 1.41.0-2+deb13u1), not inside the upstream string. Using
+                  # the git tag verbatim once produced versions like
+                  # 1.41.0+deb13u1 (no debian revision), which dpkg sorts
+                  # ABOVE any later 1.41.0-N+debNNuM build. Stay consistent
+                  # with ethercat's release workflow.
+                  #
+                  # The HAL-next flavor inserts +getset into the upstream
+                  # part (1.41.0+getset-2+deb13u1) so it always sorts above
+                  # the plain build of the same base; apt picks the highest
+                  # installable version, and the +getset deb's
+                  # linuxcnc-uspace (>= 1:2.10~) dependency is only
+                  # installable on new-API systems.
+                  base_ver=$(dpkg-parsechangelog --show-field Version)
+                  if [ "${HAL_API}" = "next" ]; then
+                      base_ver=$(echo "${base_ver}" | sed 's/-/+getset-/')
+                  fi
+                  new_ver="${base_ver}+${{ matrix.deb_rev }}"
+                  dch --newversion "${new_ver}" \
+                      --distribution stable \
+                      "Release ${GITHUB_REF_NAME} for ${{ matrix.codename }} (${HAL_API} HAL)"
 
             - name: Build deb package
               run: |
                   touch TODO
                   dpkg-buildpackage -d -us -uc -b
                   mkdir -p dist
-                  cp ../*.deb dist/
-                  rm -f dist/*-dbgsym*.deb
+                  for src in ../*.deb; do
+                      [ -f "$src" ] || continue
+                      case "$src" in *-dbgsym*) continue ;; esac
+                      cp "$src" "dist/$(basename "$src")"
+                  done
 
             - name: Run tests
               run: |
                   cd src
                   make test
 
+            - name: Upload deb artifact
+              uses: actions/upload-artifact@v7
+              with:
+                  name: linuxcnc-ethercat-deb-${{ matrix.distro }}${{ matrix.hal_api == 'next' && '-next' || '' }}
+                  path: dist/*.deb
+                  if-no-files-found: error
+
+    release:
+        name: Attach debs to GitHub release
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Download all artefacts
+              uses: actions/download-artifact@v8
+              with:
+                  path: artifacts
+
+            - name: List artefacts
+              run: find artifacts -type f -name '*.deb' -print
+
             - name: Create GitHub Release
               uses: softprops/action-gh-release@v2
               with:
-                  files: dist/*.deb
+                  files: artifacts/**/*.deb
                   generate_release_notes: true
+                  body: |
+                      ## Which deb do I need?
+
+                      Each Debian flavor ships two builds of the same source:
+
+                      - **plain** (e.g. `linuxcnc-ethercat_1.42.2-1+deb13u1`): for
+                        LinuxCNC 2.9.x and pre-getter/setter 2.10 builds.
+                      - **+getset** (e.g. `linuxcnc-ethercat_1.42.2+getset-1+deb13u1`):
+                        for LinuxCNC 2.10 with the new HAL getter/setter API.
+
+                      With the apt repository enabled you do not need to choose:
+                      apt installs the highest version whose dependencies your
+                      system satisfies, which is automatically the right one.
                   prerelease: ${{ contains(github.ref_name, '~pre') || contains(github.ref_name, '-pre') }}
+
+            - name: Trigger apt-repo ingestion
+              env:
+                  GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+              run: |
+                  if [ -z "$GH_TOKEN" ]; then
+                      echo "APT_DISPATCH_TOKEN not set; skipping ingestion dispatch."
+                      exit 0
+                  fi
+                  gh api \
+                      -X POST \
+                      -H "Accept: application/vnd.github+json" \
+                      /repos/linuxcnc-ethercat/apt/dispatches \
+                      -f event_type=ingest-release \
+                      -f "client_payload[source_repo]=${{ github.repository }}" \
+                      -f "client_payload[tag]=${{ github.ref_name }}"

@@ -589,6 +589,235 @@ static void pdo_push_entry(pdo_t *p, pdo_entry_t *e) {
   p->entries[p->entry_count++] = e;
 }
 
+// Default SDO type for standard CiA 402 objects (DS 402-2). Returned as
+// the same strings produced by `ethercat sdos`, so the caller can feed
+// them through infer_haltype unchanged. Devices that publish typed SDO
+// info will override this; this only kicks in when the bus did not
+// expose a type for a 0x6000-0x6FFF entry.
+static const char *cia402_default_type(const char *idx, const char *subidx) {
+  // Pack idx:sidx into a 32-bit key for switch-friendly comparison.
+  unsigned long i = strtoul(idx, NULL, 16);
+  unsigned long s = strtoul(subidx, NULL, 16);
+  uint32_t key = ((uint32_t)i << 8) | (s & 0xff);
+  switch (key) {
+    case 0x603f00: return "uint16";  // error code
+    case 0x604000: return "uint16";  // controlword
+    case 0x604100: return "uint16";  // statusword
+    case 0x604200: return "int16";   // vl target velocity
+    case 0x604300: return "int16";   // vl velocity demand
+    case 0x604400: return "int16";   // vl velocity actual
+    case 0x604d00: return "uint8";   // vl pole number
+    case 0x605a00: return "int16";   // quick stop option code
+    case 0x605b00: return "int16";   // shutdown option code
+    case 0x605c00: return "int16";   // disable operation option code
+    case 0x605d00: return "int16";   // halt option code
+    case 0x605e00: return "int16";   // fault reaction option code
+    case 0x606000: return "int8";    // modes of operation
+    case 0x606100: return "int8";    // modes of operation display
+    case 0x606200: return "int32";   // position demand value
+    case 0x606300: return "int32";   // position actual internal value
+    case 0x606400: return "int32";   // position actual value
+    case 0x606500: return "uint32";  // following error window
+    case 0x606600: return "uint16";  // following error timeout
+    case 0x606700: return "uint32";  // position window
+    case 0x606800: return "uint16";  // position window time
+    case 0x606900: return "int32";   // velocity sensor actual value
+    case 0x606a00: return "int16";   // sensor selection code
+    case 0x606b00: return "int32";   // velocity demand value
+    case 0x606c00: return "int32";   // velocity actual value
+    case 0x606d00: return "uint16";  // velocity window
+    case 0x606e00: return "uint16";  // velocity window time
+    case 0x606f00: return "uint16";  // velocity threshold
+    case 0x607000: return "uint16";  // velocity threshold time
+    case 0x607100: return "int16";   // target torque
+    case 0x607200: return "uint16";  // max torque
+    case 0x607300: return "uint16";  // max current
+    case 0x607400: return "int16";   // torque demand
+    case 0x607500: return "uint32";  // motor rated current
+    case 0x607600: return "uint32";  // motor rated torque
+    case 0x607700: return "int16";   // torque actual value
+    case 0x607800: return "int16";   // current actual value
+    case 0x607900: return "uint32";  // dc link circuit voltage
+    case 0x607a00: return "int32";   // target position
+    case 0x607c00: return "int32";   // home offset
+    case 0x607e00: return "uint8";   // polarity
+    case 0x607f00: return "uint32";  // max profile velocity
+    case 0x608000: return "uint32";  // max motor speed
+    case 0x608100: return "uint32";  // profile velocity
+    case 0x608200: return "uint32";  // end velocity
+    case 0x608300: return "uint32";  // profile acceleration
+    case 0x608400: return "uint32";  // profile deceleration
+    case 0x608500: return "uint32";  // quick stop deceleration
+    case 0x608600: return "int16";   // motion profile type
+    case 0x608700: return "uint32";  // torque slope
+    case 0x608800: return "int16";   // torque profile type
+    case 0x609800: return "int8";    // homing method
+    case 0x609a00: return "uint32";  // homing acceleration
+    case 0x60b000: return "int32";   // position offset
+    case 0x60b100: return "int32";   // velocity offset
+    case 0x60b200: return "int16";   // torque offset
+    case 0x60b800: return "uint16";  // touch probe function
+    case 0x60b900: return "uint16";  // touch probe status
+    case 0x60ba00: return "int32";   // touch probe pos1 pos value
+    case 0x60bb00: return "int32";   // touch probe pos1 neg value
+    case 0x60bc00: return "int32";   // touch probe pos2 pos value
+    case 0x60bd00: return "int32";   // touch probe pos2 neg value
+    case 0x60be00: return "int32";   // touch probe 3 pos value
+    case 0x60bf00: return "int32";   // touch probe 3 neg value
+    case 0x60c000: return "int16";   // interpolation sub mode select
+    case 0x60c100: return "int32";   // interpolation data record
+    case 0x60c500: return "uint32";  // max acceleration
+    case 0x60c600: return "uint32";  // max deceleration
+    case 0x60d000: return "int16";   // touch probe source
+    case 0x60d500: return "uint16";  // touch probe pos1 positive edge counter
+    case 0x60d600: return "uint16";  // touch probe pos1 negative edge counter
+    case 0x60d700: return "uint16";  // touch probe pos2 positive edge counter
+    case 0x60d800: return "uint16";  // touch probe pos2 negative edge counter
+    case 0x60e000: return "uint16";  // positive torque limit value
+    case 0x60e100: return "uint16";  // negative torque limit value
+    case 0x60f200: return "uint16";  // positioning option code
+    case 0x60f400: return "int32";   // following error actual value
+    case 0x60fd00: return "uint32";  // digital inputs
+    case 0x60ff00: return "int32";   // target velocity
+    case 0x650200: return "uint32";  // supported drive modes
+  }
+  // Sub-indexed records that need per-subidx handling.
+  if (i == 0x6046 && (s == 1 || s == 2)) return "uint32";  // vl velocity min/max amount
+  if (i == 0x6048 && s == 1) return "uint32";              // vl accel delta speed
+  if (i == 0x6048 && s == 2) return "uint16";              // vl accel delta time
+  if (i == 0x6049 && s == 1) return "uint32";              // vl decel delta speed
+  if (i == 0x6049 && s == 2) return "uint16";              // vl decel delta time
+  if (i == 0x604a && s == 1) return "uint32";              // vl quick stop delta speed
+  if (i == 0x604a && s == 2) return "uint16";              // vl quick stop delta time
+  if (i == 0x604b && (s == 1 || s == 2)) return "int16";   // vl set-point factor
+  if (i == 0x604c && (s == 1 || s == 2)) return "int32";   // vl dimension factor
+  if (i == 0x607b && (s == 1 || s == 2)) return "int32";   // position range limit
+  if (i == 0x607d && (s == 1 || s == 2)) return "int32";   // software position limit
+  if (i == 0x608f && (s == 1 || s == 2)) return "uint32";  // position encoder resolution
+  if (i == 0x6090 && (s == 1 || s == 2)) return "uint32";  // velocity encoder resolution
+  if (i == 0x6091 && (s == 1 || s == 2)) return "uint32";  // gear ratio
+  if (i == 0x6092 && (s == 1 || s == 2)) return "uint32";  // feed constant
+  if (i == 0x6093 && (s == 1 || s == 2)) return "uint32";  // position factor
+  if (i == 0x6094 && (s == 1 || s == 2)) return "uint32";  // velocity encoder factor
+  if (i == 0x6095 && (s == 1 || s == 2)) return "uint32";  // velocity factor 1
+  if (i == 0x6096 && (s == 1 || s == 2)) return "uint32";  // velocity factor
+  if (i == 0x6097 && (s == 1 || s == 2)) return "uint32";  // acceleration factor
+  if (i == 0x6099 && (s == 1 || s == 2)) return "uint32";  // homing speeds
+  if (i == 0x60c2 && (s == 1 || s == 2)) return "uint8";   // interpolation time period
+  if (i == 0x60fe && (s == 1 || s == 2)) return "uint32";  // digital outputs
+  return NULL;
+}
+
+// Default halPin name for standard CiA 402 objects. Returned as a
+// kebab-case identifier with no axis prefix; the caller is expected
+// to add a per-channel prefix when emitting a multiaxis config. NULL
+// for unknown indexes, in which case configgen falls back to the
+// `pin-IDX-SUB` placeholder.
+static const char *cia402_default_name(const char *idx, const char *subidx) {
+  unsigned long i = strtoul(idx, NULL, 16);
+  unsigned long s = strtoul(subidx, NULL, 16);
+  uint32_t key = ((uint32_t)i << 8) | (s & 0xff);
+  switch (key) {
+    case 0x603f00: return "error-code";
+    case 0x604000: return "controlword";
+    case 0x604100: return "statusword";
+    case 0x604200: return "vl-target-velocity";
+    case 0x604300: return "vl-velocity-demand";
+    case 0x604400: return "vl-velocity-actual";
+    case 0x604d00: return "vl-pole-number";
+    case 0x605a00: return "quick-stop-option-code";
+    case 0x605b00: return "shutdown-option-code";
+    case 0x605c00: return "disable-operation-option-code";
+    case 0x605d00: return "halt-option-code";
+    case 0x605e00: return "fault-reaction-option-code";
+    case 0x606000: return "mode-of-operation";
+    case 0x606100: return "mode-of-operation-display";
+    case 0x606200: return "position-demand";
+    case 0x606300: return "position-actual-internal";
+    case 0x606400: return "position-actual";
+    case 0x606500: return "following-error-window";
+    case 0x606600: return "following-error-timeout";
+    case 0x606700: return "position-window";
+    case 0x606800: return "position-window-time";
+    case 0x606900: return "velocity-sensor-actual";
+    case 0x606a00: return "sensor-selection-code";
+    case 0x606b00: return "velocity-demand";
+    case 0x606c00: return "velocity-actual";
+    case 0x606d00: return "velocity-window";
+    case 0x606e00: return "velocity-window-time";
+    case 0x606f00: return "velocity-threshold";
+    case 0x607000: return "velocity-threshold-time";
+    case 0x607100: return "target-torque";
+    case 0x607200: return "max-torque";
+    case 0x607300: return "max-current";
+    case 0x607400: return "torque-demand";
+    case 0x607500: return "motor-rated-current";
+    case 0x607600: return "motor-rated-torque";
+    case 0x607700: return "torque-actual";
+    case 0x607800: return "current-actual";
+    case 0x607900: return "dc-link-voltage";
+    case 0x607a00: return "target-position";
+    case 0x607c00: return "home-offset";
+    case 0x607e00: return "polarity";
+    case 0x607f00: return "max-profile-velocity";
+    case 0x608000: return "max-motor-speed";
+    case 0x608100: return "profile-velocity";
+    case 0x608200: return "end-velocity";
+    case 0x608300: return "profile-acceleration";
+    case 0x608400: return "profile-deceleration";
+    case 0x608500: return "quick-stop-deceleration";
+    case 0x608600: return "motion-profile-type";
+    case 0x608700: return "torque-slope";
+    case 0x608800: return "torque-profile-type";
+    case 0x609800: return "homing-method";
+    case 0x609a00: return "homing-acceleration";
+    case 0x60b000: return "position-offset";
+    case 0x60b100: return "velocity-offset";
+    case 0x60b200: return "torque-offset";
+    case 0x60b800: return "touch-probe-function";
+    case 0x60b900: return "touch-probe-status";
+    case 0x60ba00: return "touch-probe-pos1-pos-value";
+    case 0x60bb00: return "touch-probe-pos1-neg-value";
+    case 0x60bc00: return "touch-probe-pos2-pos-value";
+    case 0x60bd00: return "touch-probe-pos2-neg-value";
+    case 0x60be00: return "touch-probe-3-pos-value";
+    case 0x60bf00: return "touch-probe-3-neg-value";
+    case 0x60c000: return "interpolation-sub-mode-select";
+    case 0x60c100: return "interpolation-data-record";
+    case 0x60c500: return "max-acceleration";
+    case 0x60c600: return "max-deceleration";
+    case 0x60d000: return "touch-probe-source";
+    case 0x60d500: return "touch-probe-pos1-pos-counter";
+    case 0x60d600: return "touch-probe-pos1-neg-counter";
+    case 0x60d700: return "touch-probe-pos2-pos-counter";
+    case 0x60d800: return "touch-probe-pos2-neg-counter";
+    case 0x60e000: return "positive-torque-limit";
+    case 0x60e100: return "negative-torque-limit";
+    case 0x60f200: return "positioning-option-code";
+    case 0x60f400: return "following-error-actual";
+    case 0x60fd00: return "digital-inputs";
+    case 0x60ff00: return "target-velocity";
+    case 0x650200: return "supported-drive-modes";
+  }
+  if (i == 0x6046 && s == 1) return "vl-velocity-min-amount";
+  if (i == 0x6046 && s == 2) return "vl-velocity-max-amount";
+  if (i == 0x6048 && s == 1) return "vl-accel-delta-speed";
+  if (i == 0x6048 && s == 2) return "vl-accel-delta-time";
+  if (i == 0x6049 && s == 1) return "vl-decel-delta-speed";
+  if (i == 0x6049 && s == 2) return "vl-decel-delta-time";
+  if (i == 0x604a && s == 1) return "vl-quick-stop-delta-speed";
+  if (i == 0x604a && s == 2) return "vl-quick-stop-delta-time";
+  if (i == 0x607b && s == 1) return "position-range-limit-min";
+  if (i == 0x607b && s == 2) return "position-range-limit-max";
+  if (i == 0x607d && s == 1) return "software-position-limit-min";
+  if (i == 0x607d && s == 2) return "software-position-limit-max";
+  if (i == 0x6099 && s == 1) return "homing-speed-switch";
+  if (i == 0x6099 && s == 2) return "homing-speed-zero";
+  if (i == 0x60fe && s == 1) return "digital-outputs";
+  if (i == 0x60fe && s == 2) return "digital-outputs-bitmask";
+  return NULL;
+}
+
 static const char *infer_haltype(const char *sdotype, unsigned long bits) {
   if (bits < 8) return "bit";
   if (!strcmp(sdotype, "uint8") || !strcmp(sdotype, "uint16") || !strcmp(sdotype, "uint32")) return "u32";
@@ -668,19 +897,28 @@ static void build_pdos(ec_slave_t *s, slave_config_t *sc) {
         free(e_cmt);
         continue;
       }
-      // halpin: from comment if any, else "pin-IDX-SUB"
+      // halpin: from comment if any, else CiA 402 dictionary, else "pin-IDX-SUB"
       if (*e_cmt) {
         e->halpin = pin_format_comment(e_cmt);
       } else {
-        e->halpin = xasprintf("pin-%s-%s", e->idx, e->subidx);
+        const char *cia_name = cia402_default_name(e->idx, e->subidx);
+        if (cia_name) {
+          e->halpin = xstrdup(cia_name);
+        } else {
+          e->halpin = xasprintf("pin-%s-%s", e->idx, e->subidx);
+        }
       }
       free(e_cmt);
-      // haltype: from SDO type if known
+      // haltype: from SDO type if known, fall back to CiA 402 dictionary.
       char sdo_key[32];
       snprintf(sdo_key, sizeof(sdo_key), "0x%s:%s", e->idx, e->subidx);
       const char *sdotype = sdo_get(s, sdo_key);
+      if (!sdotype || !*sdotype) {
+        const char *cia = cia402_default_type(e->idx, e->subidx);
+        if (cia) sdotype = cia;
+      }
       unsigned long bits = strtoul(e->bitlen, NULL, 10);
-      e->haltype = xstrdup(infer_haltype(sdotype, bits));
+      e->haltype = xstrdup(infer_haltype(sdotype ? sdotype : "", bits));
       pdo_push_entry(cur_pdo, e);
     }
   }

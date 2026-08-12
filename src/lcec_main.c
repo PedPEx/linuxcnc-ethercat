@@ -28,11 +28,21 @@
 #include "devices/lcec_generic.h"
 #include "lcec.h"
 #include "rtapi_app.h"
-//#include <linuxcnc/rtapi_mutex.h>
+// #include <linuxcnc/rtapi_mutex.h>
 
 MODULE_LICENSE("GPL")
 MODULE_AUTHOR("Sascha Ittner <sascha.ittner@modusoft.de>")
 MODULE_DESCRIPTION("Driver for EtherCAT devices")
+
+/* Weak ref to HAL's initf API: present when linked against linuxcnc that
+   ships hal_init_funct_to_thread, NULL otherwise. Lets a single lcec binary
+   work against both old and new linuxcnc, with automatic fallback to legacy
+   inline activation when the new API is missing. */
+#pragma weak hal_init_funct_to_thread
+extern int hal_init_funct_to_thread(const char *funct_name, const char *thread_name, int position);
+
+/* Set in rtapi_app_main from the weak-symbol probe. */
+static int initf_supported = 0;
 
 /// @brief Global HAL Pins
 static const lcec_pindesc_t master_global_pins[] = {
@@ -59,6 +69,13 @@ static const lcec_pindesc_t master_pins[] = {
     {HAL_S32, HAL_IN, offsetof(lcec_master_data_t, pll_drift), "%s.pll-drift"},
     {HAL_S32, HAL_OUT, offsetof(lcec_master_data_t, pll_final), "%s.pll-final"},
 #endif
+    {HAL_U32, HAL_OUT, offsetof(lcec_master_data_t, wkc), "%s.wkc"},
+    {HAL_U32, HAL_OUT, offsetof(lcec_master_data_t, wkc_min), "%s.wkc-min"},
+    {HAL_U32, HAL_OUT, offsetof(lcec_master_data_t, wkc_change_cnt), "%s.wkc-change-count"},
+    {HAL_S32, HAL_OUT, offsetof(lcec_master_data_t, wkc_state), "%s.wkc-state"},
+    {HAL_BIT, HAL_IO, offsetof(lcec_master_data_t, wkc_reset), "%s.wkc-reset"},
+    {HAL_U32, HAL_OUT, offsetof(lcec_master_data_t, dc_sync_diff), "%s.dc-sync-diff"},
+    {HAL_BIT, HAL_OUT, offsetof(lcec_master_data_t, dc_sync_converged), "%s.dc-sync-converged"},
     {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
@@ -68,6 +85,8 @@ static const lcec_paramdesc_t master_params[] = {
     {HAL_U32, HAL_RW, offsetof(lcec_master_data_t, pll_step), "%s.pll-step"},
     {HAL_U32, HAL_RW, offsetof(lcec_master_data_t, pll_max_err), "%s.pll-max-err"},
 #endif
+    {HAL_U32, HAL_RW, offsetof(lcec_master_data_t, dc_sync_max), "%s.dc-sync-max"},
+    {HAL_BIT, HAL_RW, offsetof(lcec_master_data_t, dc_sync_monitor), "%s.dc-sync-monitor"},
     {HAL_TYPE_UNSPECIFIED},
 };
 
@@ -107,18 +126,54 @@ void lcec_write_all(void *arg, long period);
 void lcec_read_master(void *arg, long period);
 void lcec_write_master(void *arg, long period);
 static int lcec_activate_master(lcec_master_t *master);
+static void lcec_activate(void *arg, long period);
+static lcec_sync_unit_t *lcec_master_get_sync_unit(lcec_master_t *master, const char *name, uint32_t cycle_time);
+static int lcec_master_all_op(lcec_master_t *master);
 
 static void sigsegv_handler(int sig);
+
+static lcec_sync_unit_t *lcec_master_get_sync_unit(lcec_master_t *master, const char *name, uint32_t cycle_time) {
+  lcec_sync_unit_t *sync_unit;
+
+  if (cycle_time == 0 || master->app_time_period == 0 || (cycle_time % master->app_time_period) != 0) {
+    rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s cycle %u is not a positive multiple of appTimePeriod %u\n",
+        master->name, name, cycle_time, master->app_time_period);
+    return NULL;
+  }
+
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (strncmp(sync_unit->name, name, LCEC_CONF_STR_MAXLEN) == 0) {
+      if (sync_unit->cycle_time != cycle_time) {
+        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s cycle mismatch (%u != %u)\n", master->name, name,
+            sync_unit->cycle_time, cycle_time);
+        return NULL;
+      }
+      return sync_unit;
+    }
+  }
+
+  sync_unit = LCEC_ALLOCATE(lcec_sync_unit_t);
+  strncpy(sync_unit->name, name, LCEC_CONF_STR_MAXLEN);
+  sync_unit->name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+  sync_unit->cycle_time = cycle_time;
+  sync_unit->cycle_divider = cycle_time / master->app_time_period;
+  sync_unit->queued = 1;
+  LCEC_LIST_APPEND(master->first_sync_unit, master->last_sync_unit, sync_unit);
+
+  return sync_unit;
+}
+
+static int lcec_master_all_op(lcec_master_t *master) { return master->ms.al_states == EC_AL_STATE_OP; }
 
 /// @brief Main entrypoint from LinuxCNC
 int rtapi_app_main(void) {
   int slave_count;
   lcec_master_t *master;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
   char name[HAL_NAME_LEN + 1];
   lcec_slave_sdoconf_t *sdo_config;
   lcec_slave_idnconf_t *idn_config;
-  int pdo_entry_count = 0;
 
 #ifndef __KERNEL
   struct sigaction handler;
@@ -129,13 +184,23 @@ int rtapi_app_main(void) {
   sigaction(SIGSEGV, &handler, NULL);
   sigaction(SIGBUS, &handler, NULL);
   sigaction(SIGFPE, &handler, NULL);
-  sigaction(SIGKILL, &handler, NULL);
 #endif
 
   // connect to the HAL
   if ((lcec_comp_id = hal_init(LCEC_MODULE_NAME)) < 0) {
     rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "hal_init() failed\n");
     goto fail0;
+  }
+
+  /* Probe HAL initf support. New linuxcnc => deferred RT-context activation
+     via lcec.activate funct (clean DC phasing). Old linuxcnc => fall back to
+     legacy inline activation here in rtapi_app_main, with PLL trim covering
+     the dirty start. */
+  initf_supported = (&hal_init_funct_to_thread != NULL);
+  if (!initf_supported) {
+    rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+        "linuxcnc lacks initf support; using legacy inline activation. "
+        "DC phasing will trim via PLL. Upgrade linuxcnc for clean activation.\n");
   }
 
   // parse configuration
@@ -161,10 +226,15 @@ int rtapi_app_main(void) {
     ecrt_master_callbacks(master->master, lcec_request_lock, lcec_release_lock, master);
 #endif
 
-    // create domain
-    if (!(master->domain = ecrt_master_create_domain(master->master))) {
-      rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s domain creation failed\n", master->name);
-      goto fail2;
+    // create one process-data domain per Sync Unit
+    for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+      if (!(sync_unit->domain = ecrt_master_create_domain(master->master))) {
+        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s domain creation failed\n", master->name, sync_unit->name);
+        goto fail2;
+      }
+      if (master->domain == NULL) {
+        master->domain = sync_unit->domain;
+      }
     }
 
     // initialize slaves
@@ -180,7 +250,7 @@ int rtapi_app_main(void) {
       // initialize sdos
       if (slave->sdo_config != NULL) {
         for (sdo_config = slave->sdo_config; sdo_config->index != 0xffff;
-             sdo_config = (lcec_slave_sdoconf_t *)&sdo_config->data[sdo_config->length]) {
+            sdo_config = (lcec_slave_sdoconf_t *)&sdo_config->data[sdo_config->length]) {
           if (sdo_config->subindex == LCEC_CONF_SDO_COMPLETE_SUBIDX) {
             if (ecrt_slave_config_complete_sdo(slave->config, sdo_config->index, &sdo_config->data[0], sdo_config->length) != 0) {
               rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failed to configure slave %s.%s sdo %04x (complete)\n", master->name,
@@ -198,7 +268,7 @@ int rtapi_app_main(void) {
       // initialize idns
       if (slave->idn_config != NULL) {
         for (idn_config = slave->idn_config; idn_config->state != 0;
-             idn_config = (lcec_slave_idnconf_t *)&idn_config->data[idn_config->length]) {
+            idn_config = (lcec_slave_idnconf_t *)&idn_config->data[idn_config->length]) {
           if (ecrt_slave_config_idn(
                   slave->config, idn_config->drive, idn_config->idn, idn_config->state, &idn_config->data[0], idn_config->length) != 0) {
             rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s drive %d idn %c-%d-%d (state %d, length %u)\n",
@@ -225,6 +295,14 @@ int rtapi_app_main(void) {
 
       // configure dc for this slave
       if (slave->dc_conf != NULL) {
+        if (slave->sync_unit->cycle_divider > 1 && slave->dc_conf->sync0Cycle > 0 &&
+            slave->dc_conf->sync0Cycle != slave->sync_unit->cycle_time) {
+          rtapi_print_msg(RTAPI_MSG_WARN,
+              LCEC_MSG_PFX
+              "slave %s.%s syncUnit %s cycle=%u ns but DC sync0Cycle=%u ns; set dcConf sync0Cycle to the slave "
+              "hardware cycle or keep this slave in a matching syncUnit\n",
+              master->name, slave->name, slave->sync_unit->name, slave->sync_unit->cycle_time, slave->dc_conf->sync0Cycle);
+        }
         ecrt_slave_config_dc(slave->config, slave->dc_conf->assignActivate, slave->dc_conf->sync0Cycle, slave->dc_conf->sync0Shift,
             slave->dc_conf->sync1Cycle, slave->dc_conf->sync1Shift);
         rtapi_print_msg(RTAPI_MSG_DBG,
@@ -254,22 +332,29 @@ int rtapi_app_main(void) {
         goto fail2;
       }
 
-      pdo_entry_count += lcec_pdo_entry_reg_len(slave->regs);
+      slave->sync_unit->pdo_entry_count += lcec_pdo_entry_reg_len(slave->regs);
     }
 
-    lcec_pdo_entry_reg_t *master_regs = lcec_allocate_pdo_entry_reg(pdo_entry_count + 1);
-    for (slave = master->first_slave; slave != NULL; slave = slave->next) {
-      if (lcec_append_pdo_entry_reg(master_regs, slave->regs) < 0) {
-        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failure to append PDO entries for slave %s.%s\n", master->name, slave->name);
+    // collect and register PDO entries separately for every Sync Unit/domain
+    for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+      sync_unit->regs = lcec_allocate_pdo_entry_reg(sync_unit->pdo_entry_count + 1);
+      if (sync_unit->regs == NULL) {
+        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failure allocating PDO entries for syncUnit %s.%s\n", master->name, sync_unit->name);
         goto fail2;
       }
-    }
 
-    // register PDO entries
-    rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "register PDO entries\n");
-    if (ecrt_domain_reg_pdo_entry_list(master->domain, master_regs->pdo_entry_regs)) {
-      rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s PDO entry registration failed\n", master->name);
-      goto fail2;
+      for (slave = master->first_slave; slave != NULL; slave = slave->next) {
+        if (slave->sync_unit == sync_unit && lcec_append_pdo_entry_reg(sync_unit->regs, slave->regs) < 0) {
+          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failure to append PDO entries for slave %s.%s\n", master->name, slave->name);
+          goto fail2;
+        }
+      }
+
+      rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "register PDO entries for syncUnit %s.%s\n", master->name, sync_unit->name);
+      if (ecrt_domain_reg_pdo_entry_list(sync_unit->domain, sync_unit->regs->pdo_entry_regs)) {
+        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s PDO entry registration failed\n", master->name, sync_unit->name);
+        goto fail2;
+      }
     }
 
     // init hal data
@@ -287,10 +372,19 @@ int rtapi_app_main(void) {
     // Initialize auto-drift delay counter (wait 100 cycles before applying)
     master->hal_data->auto_drift_delay = 100;
 #endif
+    // DC synchrony convergence threshold: 4% of period (10 us at 4 kHz);
+    // app_time_period can be 0 here when the XML omits appTimePeriod.
+    master->hal_data->dc_sync_max = (master->app_time_period != 0) ? master->app_time_period / 25 : 10000;
+    // Monitor on by default (one broadcast datagram per cycle); setp to 0
+    // for zero overhead when the dc-sync pins are unused.
+    master->hal_data->dc_sync_monitor = 1;
 
-    // Activate master
-    if (lcec_activate_master(master) != 0) {
-      goto fail2;
+    // Activate master (only when initf is unavailable; otherwise lcec.activate
+    // funct does it from RT context after the user's `initf lcec.activate <thread>`).
+    if (!initf_supported) {
+      if (lcec_activate_master(master) != 0) {
+        goto fail2;
+      }
     }
 
     // export read function
@@ -303,6 +397,16 @@ int rtapi_app_main(void) {
     rtapi_snprintf(name, HAL_NAME_LEN, "%s.%s.write", LCEC_MODULE_NAME, master->name);
     if (hal_export_funct(name, lcec_write_master, master, 0, 0, lcec_comp_id) != 0) {
       rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s write funct export failed\n", master->name);
+      goto fail2;
+    }
+  }
+
+  // export activate funct (initf path only): user is expected to register it
+  // with `initf <module>.activate <thread>` in their .hal file before `start`.
+  if (initf_supported) {
+    rtapi_snprintf(name, HAL_NAME_LEN, "%s.activate", LCEC_MODULE_NAME);
+    if (hal_export_funct(name, lcec_activate, NULL, 0, 0, lcec_comp_id) != 0) {
+      rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "activate funct export failed\n");
       goto fail2;
     }
   }
@@ -499,7 +603,15 @@ int lcec_parse_config(void) {
         slave->index = slave_conf->index;
         strncpy(slave->name, slave_conf->name, LCEC_CONF_STR_MAXLEN);
         slave->name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+        strncpy(slave->sync_unit_name, slave_conf->syncUnit, LCEC_CONF_STR_MAXLEN);
+        slave->sync_unit_name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+        slave->sync_unit_cycle = slave_conf->syncUnitCycle;
         slave->master = master;
+
+        slave->sync_unit = lcec_master_get_sync_unit(master, slave->sync_unit_name, slave->sync_unit_cycle);
+        if (slave->sync_unit == NULL) {
+          goto fail2;
+        }
 
         // add slave to list
         LCEC_LIST_APPEND(master->first_slave, master->last_slave, slave);
@@ -1046,24 +1158,46 @@ void lcec_write_all(void *arg, long period) {
   }
 }
 
+/// @brief HAL init funct (registered via halcmd `initf`) that activates every
+/// master in RT context, before the cyclic funct list runs for the first time.
+/// Sets master->initf_activated so write_master knows app_phase was born stable
+/// and the BANG-BANG PLL trim can be safely skipped.
+static void lcec_activate(void *arg, long period) {
+  lcec_master_t *master;
+  (void)arg;
+  (void)period;
+
+  for (master = first_master; master != NULL; master = master->next) {
+    if (!master->activated) {
+      if (lcec_activate_master(master) == 0) {
+        master->initf_activated = 1;
+      }
+      // on activation failure, lcec_activate_master already logged; leaving
+      // initf_activated unset means the BANG-BANG safety net will run if a
+      // later retry inline-activates the master.
+    }
+  }
+}
+
 /// @brief Activate master on first call (delayed activation)
 /// This ensures activation happens inside the real-time thread,
 /// minimizing the delay between activation and cyclic communication.
 static int lcec_activate_master(lcec_master_t *master) {
   struct timeval tv;
-  
+  lcec_sync_unit_t *sync_unit;
+
   uint64_t initial_app_time;
-  
+
   if (master->activated) {
     return 0;  // Already activated
   }
-  
+
   rtapi_print_msg(RTAPI_MSG_INFO, LCEC_MSG_PFX "Activating master %s (delayed activation in RT thread)\n", master->name);
-  
+
   // Initialize application time base (now we're in the RT thread context)
   lcec_gettimeofday(&tv);
   master->app_time_base = EC_TIMEVAL2NANO(tv);
-  
+
 #ifdef RTAPI_TASK_PLL_SUPPORT
   master->dc_time_valid_last = 0;
   master->dc_ref = 0;
@@ -1099,14 +1233,22 @@ static int lcec_activate_master(lcec_master_t *master) {
     rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failed to activate master %s\n", master->name);
     return -1;
   }
-  
-  // Get internal process data for domain
-  master->process_data = ecrt_domain_data(master->domain);
-  master->process_data_len = ecrt_domain_size(master->domain);
-  
+
+  // Get internal process data for every Sync Unit domain.
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    sync_unit->process_data = ecrt_domain_data(sync_unit->domain);
+    sync_unit->process_data_len = ecrt_domain_size(sync_unit->domain);
+    if (master->process_data == NULL) {
+      master->process_data = sync_unit->process_data;
+      master->process_data_len = sync_unit->process_data_len;
+    }
+    rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "master %s syncUnit %s cycle=%u ns divider=%u process_data_len=%d\n", master->name,
+        sync_unit->name, sync_unit->cycle_time, sync_unit->cycle_divider, sync_unit->process_data_len);
+  }
+
   master->activated = 1;
   rtapi_print_msg(RTAPI_MSG_INFO, LCEC_MSG_PFX "Master %s activated successfully\n", master->name);
-  
+
   return 0;
 }
 
@@ -1114,19 +1256,41 @@ static int lcec_activate_master(lcec_master_t *master) {
 void lcec_read_master(void *arg, long period) {
   lcec_master_t *master = (lcec_master_t *)arg;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
   int check_states;
 
-  // check period
+  // Master not yet activated: process_data is NULL until lcec_activate_master()
+  // runs. On new (initf-capable) linuxcnc loaded with a legacy .hal that omits
+  // `initf lcec.activate <thread>`, lcec_write_master() inline-activates as a
+  // fallback -- but read-all is conventionally addf'd *before* write-all, so
+  // without this bail the slave proc_read below dereferences the NULL
+  // process_data and SIGSEGVs the whole realtime before write-all ever runs.
+  // Skip this cycle; write_master activates the master and reads resume on the
+  // next tick. This keeps `initf` optional and old configs crash-free.
+  if (!master->activated) {
+    return;
+  }
+
+  // check period. If the XML omitted appTimePeriod, master->app_time_period
+  // is 0 and the modulo at lcec_main.c:1258 would SIGFPE on the first cycle;
+  // adopt the actual HAL servo period so the XML attribute is optional.
   if (period != master->period_last) {
     master->period_last = period;
-    if (master->app_time_period != period) {
+    if (master->app_time_period == 0) {
+      rtapi_print_msg(
+          RTAPI_MSG_INFO, LCEC_MSG_PFX "appTimePeriod not set for master %s, using HAL thread period %ld ns\n", master->name, period);
+      master->app_time_period = period;
+    } else if (master->app_time_period != period) {
       rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "Invalid appTimePeriod of %u for master %s (should be %ld).\n", master->app_time_period,
           master->name, period);
     }
   }
 
   // get state check flag
-  if (master->state_update_timer > 0) {
+  if (!master->sync_units_started) {
+    check_states = 1;
+    master->state_update_timer = 0;
+  } else if (master->state_update_timer > 0) {
     check_states = 0;
     master->state_update_timer -= period;
   } else {
@@ -1135,16 +1299,100 @@ void lcec_read_master(void *arg, long period) {
   }
 
   // receive process data & master state
+  ec_domain_state_t domain_state;
+  int all_domains_zero = 1;
+  int all_domains_complete = 1;
+  uint32_t dc_sync_diff;
   rtapi_mutex_get(&master->mutex);
   ecrt_master_receive(master->master);
-  ecrt_domain_process(master->domain);
+  domain_state.working_counter = 0;
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    ec_domain_state_t sync_unit_state;
+
+    sync_unit->process = sync_unit->queued;
+    if (sync_unit->process) {
+      ecrt_domain_process(sync_unit->domain);
+      sync_unit->queued = 0;
+    }
+
+    // Aggregate the most recent state of every Sync Unit so the master WKC
+    // pins continue to describe the complete process image. Domains that are
+    // not scheduled this cycle retain their last reported state.
+    ecrt_domain_state(sync_unit->domain, &sync_unit_state);
+    domain_state.working_counter += sync_unit_state.working_counter;
+    if (sync_unit_state.wc_state != EC_WC_ZERO) {
+      all_domains_zero = 0;
+    }
+    if (sync_unit_state.wc_state != EC_WC_COMPLETE) {
+      all_domains_complete = 0;
+    }
+  }
+  domain_state.wc_state = all_domains_complete ? EC_WC_COMPLETE : (all_domains_zero ? EC_WC_ZERO : EC_WC_INCOMPLETE);
+  dc_sync_diff = master->hal_data->dc_sync_monitor ? ecrt_master_sync_monitor_process(master->master) : 0xffffffffu;
   if (check_states) {
     ecrt_master_state(master->master, &master->ms);
+  }
+  if (!master->sync_units_started && lcec_master_all_op(master)) {
+    master->sync_units_started = 1;
   }
   rtapi_mutex_give(&master->mutex);
 
   // update state pins
   lcec_update_master_hal(master->hal_data, &master->ms);
+
+  // update working counter pins; min/change tracking starts once the domain
+  // first reaches a complete exchange (EC_WC_COMPLETE), so bring-up ramping
+  // does not pollute the stats
+  {
+    lcec_master_data_t *hd = master->hal_data;
+    uint32_t wkc_now = domain_state.working_counter;
+
+    // user-requested stats reset: clear min/change tracking and re-arm the
+    // first-complete-exchange gate so wkc-min re-anchors; pin self-clears
+    if (*(hd->wkc_reset)) {
+      *(hd->wkc_reset) = 0;
+      hd->wkc_full_seen = 0;
+      *(hd->wkc_min) = 0;
+      *(hd->wkc_change_cnt) = 0;
+    }
+
+    *(hd->wkc) = wkc_now;
+    *(hd->wkc_state) = (hal_s32_t)domain_state.wc_state;
+    if (!hd->wkc_full_seen) {
+      if (domain_state.wc_state == EC_WC_COMPLETE) {
+        hd->wkc_full_seen = 1;
+        *(hd->wkc_min) = wkc_now;
+        *(hd->wkc_change_cnt) = 0;
+      }
+    } else {
+      if (wkc_now < *(hd->wkc_min)) {
+        *(hd->wkc_min) = wkc_now;
+      }
+      // no rtapi_print here: a flapping bus would emit at cycle rate from the
+      // RT thread; the change counter pin + recorder are the log
+      if (wkc_now != hd->wkc_last) {
+        (*(hd->wkc_change_cnt))++;
+      }
+    }
+    hd->wkc_last = wkc_now;
+
+    // DC synchrony: broadcast read of system time difference (0x092C);
+    // 0xffffffff means the monitor datagram was not received this cycle.
+    // Tolerate a few consecutive misses (startup, single datagram timeouts),
+    // then invalidate so a dead bus cannot keep showing stale-converged.
+    if (hd->dc_sync_monitor) {
+      if (dc_sync_diff != 0xffffffffu) {
+        hd->dc_sync_miss_cnt = 0;
+        *(hd->dc_sync_diff) = dc_sync_diff;
+        *(hd->dc_sync_converged) = (dc_sync_diff < hd->dc_sync_max);
+      } else if (hd->dc_sync_miss_cnt < LCEC_DC_SYNC_MISS_MAX) {
+        hd->dc_sync_miss_cnt++;
+      } else {
+        *(hd->dc_sync_converged) = 0;
+        *(hd->dc_sync_diff) = 0xffffffffu;
+      }
+    }
+  }
 
   // update global state
   global_ms.slaves_responding += master->ms.slaves_responding;
@@ -1164,8 +1412,10 @@ void lcec_read_master(void *arg, long period) {
     }
 
     // process read function
-    if (slave->proc_read != NULL) {
-      slave->proc_read(slave, period);
+    if (slave->sync_unit->process && slave->proc_read != NULL) {
+      master->process_data = slave->sync_unit->process_data;
+      master->process_data_len = slave->sync_unit->process_data_len;
+      slave->proc_read(slave, slave->sync_unit->cycle_time);
     }
   }
 }
@@ -1174,6 +1424,8 @@ void lcec_read_master(void *arg, long period) {
 void lcec_write_master(void *arg, long period) {
   lcec_master_t *master = (lcec_master_t *)arg;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
+  int force_cycle;
   uint64_t app_time;
   long long now;
 #ifdef RTAPI_TASK_PLL_SUPPORT
@@ -1181,15 +1433,49 @@ void lcec_write_master(void *arg, long period) {
   lcec_master_data_t *hal_data;
 #endif
 
-  // Skip if master not yet activated (should have been activated in read)
+  // First cyclic tick observed master not yet activated. This means the user
+  // did not register `lcec.activate` via initf (forgot the line in their .hal).
+  // Fall back to inline activation so the machine still runs; warn loudly so
+  // the user fixes their config. initf_activated stays 0, so the BANG-BANG
+  // safety net below will trim the dirty app_phase over the next few hundred
+  // cycles, just like the legacy path.
   if (!master->activated) {
-    return;
+    if (!master->forgot_warned) {
+      master->forgot_warned = 1;
+      rtapi_print_msg(RTAPI_MSG_ERR,
+          LCEC_MSG_PFX
+          "master '%s' not activated via initf. "
+          "Add `initf %s.activate <thread>` to your .hal file before `start`. "
+          "Falling back to inline activation; DC phasing will trim via PLL.\n",
+          master->name, LCEC_MODULE_NAME);
+    }
+    if (lcec_activate_master(master) != 0) {
+      return;  // activation failed, can't proceed this cycle
+    }
+  }
+
+  // Keep all domains cycling during startup. Once OP has been reached, run
+  // each Sync Unit at its configured integer divider.
+  force_cycle = !master->sync_units_started;
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (force_cycle) {
+      sync_unit->write = 1;
+      sync_unit->cycle_counter = 0;
+    } else if (sync_unit->cycle_counter == 0) {
+      sync_unit->write = 1;
+      sync_unit->cycle_counter = sync_unit->cycle_divider - 1;
+    } else {
+      sync_unit->write = 0;
+      sync_unit->cycle_counter--;
+    }
   }
 
   // process slaves
   for (slave = master->first_slave; slave != NULL; slave = slave->next) {
-    if (slave->proc_write != NULL) {
-      slave->proc_write(slave, period);
+    if (slave->sync_unit->write && slave->proc_write != NULL) {
+      master->process_data = slave->sync_unit->process_data;
+      master->process_data_len = slave->sync_unit->process_data_len;
+      slave->proc_write(slave, slave->sync_unit->cycle_time);
     }
   }
 
@@ -1200,7 +1486,12 @@ void lcec_write_master(void *arg, long period) {
 
   // send process data
   rtapi_mutex_get(&master->mutex);
-  ecrt_domain_queue(master->domain);
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (sync_unit->write) {
+      ecrt_domain_queue(sync_unit->domain);
+      sync_unit->queued = 1;
+    }
+  }
 
   // update application time
   now = rtapi_get_time();
@@ -1221,14 +1512,21 @@ void lcec_write_master(void *arg, long period) {
   ecrt_master_application_time(master->master, app_time);
 
   // Read DC reference clock time (must be before sync_slave_clocks which
-  // re-queues the sync datagram and overwrites the received data)
+  // re-queues the sync datagram and overwrites the received data).
+  // Skip when free running: the ioctl fails there and the library prints
+  // to stderr from this thread. R2M also has sync_to_ref_clock == 0, so
+  // both terms are needed.
 #ifdef RTAPI_TASK_PLL_SUPPORT
   uint32_t dc_time = 0;
-  int dc_time_valid = (ecrt_master_reference_clock_time(master->master, &dc_time) == 0);
+  int dc_time_valid = 0;
+  if (master->sync_to_ref_clock || master->sync_ref_cycles) {
+    dc_time_valid = (ecrt_master_reference_clock_time(master->master, &dc_time) == 0);
+  }
 #endif
 
-  // sync ref clock to master
-  if (!master->sync_to_ref_clock) {
+  // sync ref clock to master (skip when free running: sync_ref_cycles == 0,
+  // the datagram is pointless and sync_ref_cnt would just run negative)
+  if (!master->sync_to_ref_clock && master->sync_ref_cycles > 0) {
     if (master->sync_ref_cnt == 0) {
       master->sync_ref_cnt = master->sync_ref_cycles;
       ecrt_master_sync_reference_clock(master->master);
@@ -1238,6 +1536,12 @@ void lcec_write_master(void *arg, long period) {
 
   // sync slaves to ref clock
   ecrt_master_sync_slave_clocks(master->master);
+
+  // queue DC synchrony monitor datagram (broadcast read of 0x092C),
+  // processed next cycle in lcec_read_master
+  if (master->hal_data->dc_sync_monitor) {
+    ecrt_master_sync_monitor_queue(master->master);
+  }
 
   // send domain data
   ecrt_master_send(master->master);
@@ -1250,7 +1554,7 @@ void lcec_write_master(void *arg, long period) {
   *(hal_data->pll_err) = 0;
   *(hal_data->pll_out) = 0;
   *(hal_data->dc_phased) = 0;
-  
+
   // Calculate app_phase: our execution position in local cycle
   // This is relative to dc_ref_time (the time we set at activation)
   // app_phase = (app_time - dc_ref_time) % period
@@ -1258,12 +1562,12 @@ void lcec_write_master(void *arg, long period) {
   int32_t current_app_phase = (int32_t)((app_time - master->dc_ref_time) % master->app_time_period);
   *(hal_data->app_phase) = current_app_phase;
   int32_t app_period = (int32_t)master->app_time_period;
-  
+
   // When sync_to_ref_clock = false: adjust app_phase to a stable position using PLL
   // This is needed because app_phase is random at startup
   if (!master->sync_to_ref_clock) {
-    #define PHASE_MEASURE_CYCLES 100
-    
+#define PHASE_MEASURE_CYCLES 100
+
     if (!hal_data->phase_calibrated) {
       // Phase 1: Measure app_phase jitter over PHASE_MEASURE_CYCLES cycles
       if (hal_data->phase_measure_cnt == 0) {
@@ -1276,7 +1580,7 @@ void lcec_write_master(void *arg, long period) {
         // Detect boundary crossing: if difference > app_period/2, phase wrapped around
         int32_t diff = current_app_phase - hal_data->phase_last;
         int32_t adjusted_phase = current_app_phase;
-        
+
         // Unwrap: if phase jumped by more than half period, adjust for continuity
         if (diff > app_period / 2) {
           // Jumped from low to high (e.g., 10000 -> 990000), adjust down
@@ -1285,7 +1589,7 @@ void lcec_write_master(void *arg, long period) {
           // Jumped from high to low (e.g., 990000 -> 10000), adjust up
           adjusted_phase = current_app_phase + app_period;
         }
-        
+
         // Update min/max with adjusted phase
         if (adjusted_phase < hal_data->phase_min) {
           hal_data->phase_min = adjusted_phase;
@@ -1293,50 +1597,54 @@ void lcec_write_master(void *arg, long period) {
         if (adjusted_phase > hal_data->phase_max) {
           hal_data->phase_max = adjusted_phase;
         }
-        
+
         hal_data->phase_last = current_app_phase;
         hal_data->phase_measure_cnt++;
       } else {
         // Phase 2: Calculate jitter and target position
         hal_data->phase_jitter = hal_data->phase_max - hal_data->phase_min;
         *(hal_data->phase_jitter_out) = hal_data->phase_jitter;  // Output jitter for debugging
-        
+
         // Target position: jitter + jitter/2 = jitter * 1.5
         int32_t target = hal_data->phase_jitter + hal_data->phase_jitter / 2;
-        
+
         // Limit target to app_period/8
         int32_t max_target = app_period / 8;
         if (target > max_target) {
           target = max_target;
         }
-        
+
         hal_data->phase_target = target;
         hal_data->phase_calibrated = 1;
-        
-        rtapi_print_msg(RTAPI_MSG_INFO, LCEC_MSG_PFX "Phase calibration complete: jitter=%d target=%d\n",
-            hal_data->phase_jitter, hal_data->phase_target);
+
+        rtapi_print_msg(RTAPI_MSG_INFO, LCEC_MSG_PFX "Phase calibration complete: jitter=%d target=%d\n", hal_data->phase_jitter,
+            hal_data->phase_target);
       }
-    } else {
-      // Phase 3: Use PLL to move app_phase towards target
+    } else if (!master->initf_activated) {
+      // Phase 3: Use PLL to move app_phase towards target.
+      // Only runs when activation was dirty (legacy load-time path or inline
+      // fallback after forgot-to-initf). With initf_activated=1 the master was
+      // activated cleanly in RT context, app_phase is born stable, and the
+      // BANG-BANG would only add noise -- skip it entirely.
       // Calculate error: how far are we from target?
       // Positive error (app_phase > target) means we need to speed up to reduce app_phase
       // Negative error (app_phase < target) means we need to slow down to increase app_phase
       int32_t phase_error = current_app_phase - hal_data->phase_target;
-      
+
       // Set pll_err for monitoring
       //*(hal_data->pll_err) = raw_offset + drift;
-      
+
       // Check if locked (within 10% of jitter or 1% of app_period, whichever is larger)
-      int32_t lock_threshold = 0;//hal_data->phase_jitter;
+      int32_t lock_threshold = 0;  // hal_data->phase_jitter;
       if (lock_threshold < app_period / 100) {
         lock_threshold = app_period / 100;
       }
-      if (abs(phase_error) < abs(hal_data->pll_step) * 3 ) {
+      if (abs(phase_error) < abs(hal_data->pll_step) * 3) {
         *(hal_data->dc_phased) = 1;
-      } else if (abs(phase_error) > abs(hal_data->pll_step) * 20 ) {
+      } else if (abs(phase_error) > abs(hal_data->pll_step) * 20) {
         *(hal_data->dc_phased) = 0;
       }
-      
+
       // BANG-BANG control: small steps to move towards target
       // Positive pll_out = slow down = app_phase increases
       // Negative pll_out = speed up = app_phase decreases
@@ -1350,14 +1658,21 @@ void lcec_write_master(void *arg, long period) {
         }
       }
 
+    } else {
+      // initf_activated: clean RT-context activation, app_phase is born stable.
+      // Force PLL outputs to safe values so rtapi_task_pll_get_reference does
+      // not see stale BANG-BANG state. Manual pll_drift pin still applies via
+      // pll_correction = pll_out + pll_drift further down.
+      *(hal_data->pll_out) = 0;
+      *(hal_data->dc_phased) = 1;
     }
   }
-  
+
   // the first read dc_time value seems to be invalid, so wait for two successive successful reads
   if (dc_time_valid && master->dc_time_valid_last) {
     // Raw offset between app_time and dc_time (this is what varies at each startup)
     int32_t raw_offset = master->app_time_last - dc_time;
-    
+
     // Apply drift compensation based on drift-mode:
     //   0 = simple: (app_period - app_phase) % app_period
     //   1 = manual: use pll-drift pin value
@@ -1377,23 +1692,46 @@ void lcec_write_master(void *arg, long period) {
       }
     }
     // Mode 1 or other: use manual pll-drift value
-    
-    *(hal_data->pll_err) = raw_offset + drift;
-    
+
+    // Fold pll_err into (-period/2, period/2]. drift jumps a full period
+    // when app_phase crosses zero; raw_offset is physical and cannot
+    // follow. Two steps handle the startup cycle where the sum can exceed
+    // 1.5 periods in one pass (#501).
+    int32_t pll_err = raw_offset + drift;
+    if (pll_err > app_period / 2) {
+      pll_err -= app_period;
+    } else if (pll_err < -(app_period / 2)) {
+      pll_err += app_period;
+    }
+    if (pll_err > app_period / 2) {
+      pll_err -= app_period;
+    } else if (pll_err < -(app_period / 2)) {
+      pll_err += app_period;
+    }
+    *(hal_data->pll_err) = pll_err;
+
     // PLL is considered phased if error is within 10% of period
     int32_t lock_threshold = master->app_time_period / 10;
     if (abs(*(hal_data->pll_err)) < lock_threshold) {
       *(hal_data->dc_phased) = 1;
     }
-    
+
     // Only run automatic PLL adjustment when sync_to_ref_clock is enabled
     // When sync_to_ref_clock = false, master is the clock source, DC syncs to us
     // When sync_to_ref_clock = true, DC is the clock source, we sync to DC
     if (master->sync_to_ref_clock) {
-      // check for invalid error values
-      if (abs(*(hal_data->pll_err)) > hal_data->pll_max_err) {
+      // Watchdog on the physical offset, not the folded error: folded,
+      // |pll_err| <= period/2 could never reach the default threshold, and
+      // a whole-period displacement would go undetected. Remove only whole
+      // periods; the controller drives the remainder to zero.
+      if (abs(raw_offset) > hal_data->pll_max_err) {
+        int32_t resync_corr = raw_offset;
+        if (raw_offset >= app_period || raw_offset <= -app_period) {
+          // the division runs only on the cycle a resync fires
+          resync_corr = (raw_offset / app_period) * app_period;
+        }
         // force resync of master time
-        master->dc_ref -= *(hal_data->pll_err);
+        master->dc_ref -= resync_corr;
         // skip next control cycle to allow resync
         dc_time_valid = 0;
         // increment reset counter to document this event
@@ -1403,7 +1741,7 @@ void lcec_write_master(void *arg, long period) {
           hal_data->auto_drift_delay = 100;
         }
       } else {
-          *(hal_data->pll_out) = (*(hal_data->pll_err) < 0) ? -(hal_data->pll_step) : (hal_data->pll_step);
+        *(hal_data->pll_out) = (pll_err < 0) ? -(hal_data->pll_step) : (hal_data->pll_step);
       }
     }
     // Note: When sync_to_ref_clock = false, pll_out is set in the phase calibration code above
@@ -1425,15 +1763,14 @@ void lcec_write_master(void *arg, long period) {
       pll_correction = *(hal_data->pll_out) + *(hal_data->pll_drift);
     }
   }
-  
+
   *(hal_data->pll_final) = pll_correction;
   rtapi_task_pll_set_correction(pll_correction);
-  
+
   master->app_time_last = (uint32_t)app_time;
   master->dc_time_valid_last = dc_time_valid;
 #endif
 }
-
 
 #ifndef __KERNEL__
 #define BACKTRACE_SIZE 100
