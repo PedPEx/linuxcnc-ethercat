@@ -18,36 +18,81 @@
 
 /// @file
 /// @brief Driver for Beckhoff EL5002 Encoder modules
+///
+/// FIX 1 (id decoding): the modParam descriptor table combined the channel
+/// selector and the function selector with the logical OR "||" instead of the
+/// bitwise OR "|".  "A || B" evaluates to 0/1, so every modParam id collapsed
+/// to the same value and the id decoding ((p->id & CH_MASK) / (p->id &
+/// FNK_MASK)) could never recover channel or function.  All 22 entries now use
+/// bitwise "|".
+///
+/// FIX 2 (defaults): the SSI settings (object 0x80n0) are now pre-loaded with
+/// the Beckhoff factory defaults and only overridden by modParams that are
+/// actually present in the XML config.  A parameter left out of the XML
+/// therefore results in the Beckhoff default.  To keep the mailbox quiet, an
+/// object is only written when the effective value differs from that default,
+/// so an unset parameter produces no SDO write and the device keeps its own
+/// (identical) default.  Writes are non-fatal warnings now instead of aborting
+/// the whole master init.
 
 #include "lcec_el5002.h"
 
 #include "../lcec.h"
 
+/* ======================================================================
+ * Beckhoff factory defaults for the EL5002 SSI settings object 0x80n0.
+ * Source: Beckhoff Information System, "EL500x SSI Geber Interface",
+ * object 0x80n0 (n = 0 -> Ch.1 at 0x8000, n = 1 -> Ch.2 at 0x8010).
+ *   :01 Disable frame error       BOOLEAN  0
+ *   :02 Enable power failure bit   BOOLEAN  0
+ *   :03 Enable inhibit time        BOOLEAN  0
+ *   :06 SSI coding                 BIT1     1  (0 = binary, 1 = gray)
+ *   :09 SSI baudrate               BIT3     3  (3 = 500 kBaud)      (FW03+)
+ *   :0C SSI clock jitter comp.     BIT3     0                      (FW03+)
+ *   :0F SSI frame type             BIT2     0  (0 = multiturn, 25-bit frame)
+ *   :11 SSI frame size [bit]       UINT16   25
+ *   :12 SSI data length [bit]      UINT16   24
+ *   :13 Min. inhibit time [us]     UINT16   0
+ *   :14 Number of clock bursts     UINT16   1                      (FW03+)
+ * (:04 Enable test mode is intentionally not exposed as a modParam.)
+ * ====================================================================== */
+#define DEF_DIS_FRAME_ERR     0
+#define DEF_EN_PWR_FAIL_CHK   0
+#define DEF_EN_INHIBIT_TIME   0
+#define DEF_CODING            1   /* gray code         */
+#define DEF_BAUDRATE          3   /* 500 kBaud         */
+#define DEF_CLK_JIT_COMP      0
+#define DEF_FRAME_TYPE        0   /* multiturn, 25-bit */
+#define DEF_FRAME_SIZE        25
+#define DEF_DATA_LEN          24
+#define DEF_MIN_INHIBIT_TIME  0
+#define DEF_NO_CLK_BURSTS     1
+
 static int lcec_el5002_init(int comp_id, lcec_slave_t *slave);
 
 static lcec_modparam_desc_t lcec_el5002_modparams[] = {
-    {"ch0DisFrameErr", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_DIS_FRAME_ERR, MODPARAM_TYPE_BIT},
-    {"ch0EnPwrFailChk", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK, MODPARAM_TYPE_BIT},
-    {"ch0EnInhibitTime", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_EN_INHIBIT_TIME, MODPARAM_TYPE_BIT},
-    {"ch0Coding", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_CODING, MODPARAM_TYPE_U32},
-    {"ch0Baudrate", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_BAUDRATE, MODPARAM_TYPE_U32},
-    {"ch0ClkJitComp", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_CLK_JIT_COMP, MODPARAM_TYPE_U32},
-    {"ch0FrameType", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_FRAME_TYPE, MODPARAM_TYPE_U32},
-    {"ch0FrameSize", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_FRAME_SIZE, MODPARAM_TYPE_U32},
-    {"ch0DataLen", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_DATA_LEN, MODPARAM_TYPE_U32},
-    {"ch0MinInhibitTime", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_MIN_INHIBIT_TIME, MODPARAM_TYPE_U32},
-    {"ch0NoClkBursts", LCEC_EL5002_PARAM_CH_0 || LCEC_EL5002_PARAM_NO_CLK_BURSTS, MODPARAM_TYPE_U32},
-    {"ch1DisFrameErr", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_DIS_FRAME_ERR, MODPARAM_TYPE_BIT},
-    {"ch1EnPwrFailChk", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK, MODPARAM_TYPE_BIT},
-    {"ch1EnInhibitTime", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_EN_INHIBIT_TIME, MODPARAM_TYPE_BIT},
-    {"ch1Coding", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_CODING, MODPARAM_TYPE_U32},
-    {"ch1Baudrate", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_BAUDRATE, MODPARAM_TYPE_U32},
-    {"ch1ClkJitComp", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_CLK_JIT_COMP, MODPARAM_TYPE_U32},
-    {"ch1FrameType", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_FRAME_TYPE, MODPARAM_TYPE_U32},
-    {"ch1FrameSize", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_FRAME_SIZE, MODPARAM_TYPE_U32},
-    {"ch1DataLen", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_DATA_LEN, MODPARAM_TYPE_U32},
-    {"ch1MinInhibitTime", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_MIN_INHIBIT_TIME, MODPARAM_TYPE_U32},
-    {"ch1NoClkBursts", LCEC_EL5002_PARAM_CH_1 || LCEC_EL5002_PARAM_NO_CLK_BURSTS, MODPARAM_TYPE_U32},
+    {"ch0DisFrameErr", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_DIS_FRAME_ERR, MODPARAM_TYPE_BIT},
+    {"ch0EnPwrFailChk", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK, MODPARAM_TYPE_BIT},
+    {"ch0EnInhibitTime", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_EN_INHIBIT_TIME, MODPARAM_TYPE_BIT},
+    {"ch0Coding", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_CODING, MODPARAM_TYPE_U32},
+    {"ch0Baudrate", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_BAUDRATE, MODPARAM_TYPE_U32},
+    {"ch0ClkJitComp", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_CLK_JIT_COMP, MODPARAM_TYPE_BIT},
+    {"ch0FrameType", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_FRAME_TYPE, MODPARAM_TYPE_U32},
+    {"ch0FrameSize", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_FRAME_SIZE, MODPARAM_TYPE_U32},
+    {"ch0DataLen", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_DATA_LEN, MODPARAM_TYPE_U32},
+    {"ch0MinInhibitTime", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_MIN_INHIBIT_TIME, MODPARAM_TYPE_U32},
+    {"ch0NoClkBursts", LCEC_EL5002_PARAM_CH_0 | LCEC_EL5002_PARAM_NO_CLK_BURSTS, MODPARAM_TYPE_U32},
+    {"ch1DisFrameErr", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_DIS_FRAME_ERR, MODPARAM_TYPE_BIT},
+    {"ch1EnPwrFailChk", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK, MODPARAM_TYPE_BIT},
+    {"ch1EnInhibitTime", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_EN_INHIBIT_TIME, MODPARAM_TYPE_BIT},
+    {"ch1Coding", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_CODING, MODPARAM_TYPE_U32},
+    {"ch1Baudrate", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_BAUDRATE, MODPARAM_TYPE_U32},
+    {"ch1ClkJitComp", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_CLK_JIT_COMP, MODPARAM_TYPE_BIT},
+    {"ch1FrameType", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_FRAME_TYPE, MODPARAM_TYPE_U32},
+    {"ch1FrameSize", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_FRAME_SIZE, MODPARAM_TYPE_U32},
+    {"ch1DataLen", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_DATA_LEN, MODPARAM_TYPE_U32},
+    {"ch1MinInhibitTime", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_MIN_INHIBIT_TIME, MODPARAM_TYPE_U32},
+    {"ch1NoClkBursts", LCEC_EL5002_PARAM_CH_1 | LCEC_EL5002_PARAM_NO_CLK_BURSTS, MODPARAM_TYPE_U32},
     {NULL},
 };
 
@@ -96,6 +141,22 @@ typedef struct {
   lcec_el5002_chan_t chans[LCEC_EL5002_CHANS];
   int last_operational;
 } lcec_el5002_data_t;
+
+/* Per-channel SSI settings, pre-loaded with the Beckhoff factory defaults and
+ * overridden by any modParam present in the XML config.                       */
+typedef struct {
+  uint8_t  dis_frame_err;     /* 80n0:01 */
+  uint8_t  en_pwr_fail_chk;   /* 80n0:02 */
+  uint8_t  en_inhibit_time;   /* 80n0:03 */
+  uint8_t  coding;            /* 80n0:06 */
+  uint8_t  baudrate;          /* 80n0:09 */
+  uint8_t  clk_jit_comp;      /* 80n0:0C */
+  uint8_t  frame_type;        /* 80n0:0F */
+  uint16_t frame_size;        /* 80n0:11 */
+  uint16_t data_len;          /* 80n0:12 */
+  uint16_t min_inhibit_time;  /* 80n0:13 */
+  uint16_t no_clk_bursts;     /* 80n0:14 */
+} el5002_chan_cfg_t;
 
 static const lcec_pindesc_t slave_pins[] = {
     {HAL_BIT, HAL_IN, offsetof(lcec_el5002_chan_t, reset), "%s.%s.%s.enc-%d-reset"},
@@ -157,81 +218,118 @@ static int lcec_el5002_init(int comp_id, lcec_slave_t *slave) {
   lcec_slave_modparam_t *p;
   lcec_el5002_data_t *hal_data;
   int i;
+  int ch;
+  int base;
   lcec_el5002_chan_t *chan;
+  el5002_chan_cfg_t cfg[LCEC_EL5002_CHANS];
   int err;
 
-  // set config patameters
+  // pre-load every channel with the Beckhoff factory defaults; any modParam
+  // present in the XML overrides its field below.
+  for (i = 0; i < LCEC_EL5002_CHANS; i++) {
+    cfg[i].dis_frame_err    = DEF_DIS_FRAME_ERR;
+    cfg[i].en_pwr_fail_chk  = DEF_EN_PWR_FAIL_CHK;
+    cfg[i].en_inhibit_time  = DEF_EN_INHIBIT_TIME;
+    cfg[i].coding           = DEF_CODING;
+    cfg[i].baudrate         = DEF_BAUDRATE;
+    cfg[i].clk_jit_comp     = DEF_CLK_JIT_COMP;
+    cfg[i].frame_type       = DEF_FRAME_TYPE;
+    cfg[i].frame_size       = DEF_FRAME_SIZE;
+    cfg[i].data_len         = DEF_DATA_LEN;
+    cfg[i].min_inhibit_time = DEF_MIN_INHIBIT_TIME;
+    cfg[i].no_clk_bursts    = DEF_NO_CLK_BURSTS;
+  }
+
+  // collect modParam overrides into the per-channel config
   for (p = slave->modparams; p != NULL && p->id >= 0; p++) {
-    // get channel offset
-    i = (p->id & LCEC_EL5002_PARAM_CH_MASK) << 4;
+    ch = p->id & LCEC_EL5002_PARAM_CH_MASK;   // 0 or 1
+    if (ch < 0 || ch >= LCEC_EL5002_CHANS) {
+      rtapi_print_msg(RTAPI_MSG_WARN,
+        LCEC_MSG_PFX "slave %s.%s: modParam id 0x%x has out-of-range channel %d, ignored\n",
+        master->name, slave->name, p->id, ch);
+      continue;
+    }
     switch (p->id & LCEC_EL5002_PARAM_FNK_MASK) {
-      case LCEC_EL5002_PARAM_DIS_FRAME_ERR:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x01, p->value.bit) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo DisFrameErr\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x02, p->value.bit) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo EnPwrFailChk\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_EN_INHIBIT_TIME:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x03, p->value.bit) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo EnInhibitTime\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_CODING:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x06, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo Coding\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_BAUDRATE:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x09, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo Baudrate\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_CLK_JIT_COMP:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x0c, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo ClkJitComp\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_FRAME_TYPE:
-        if (lcec_write_sdo8(slave, 0x8000 + i, 0x0f, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo FrameType\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_FRAME_SIZE:
-        if (lcec_write_sdo16(slave, 0x8000 + i, 0x11, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo FrameSize\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_DATA_LEN:
-        if (lcec_write_sdo16(slave, 0x8000 + i, 0x12, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo DataLen\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_MIN_INHIBIT_TIME:
-        if (lcec_write_sdo16(slave, 0x8000 + i, 0x13, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo MinInhibitTime\n", master->name, slave->name);
-          return -1;
-        }
-        break;
-      case LCEC_EL5002_PARAM_NO_CLK_BURSTS:
-        if (lcec_write_sdo16(slave, 0x8000 + i, 0x14, p->value.u32) != 0) {
-          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo NoClkBursts\n", master->name, slave->name);
-          return -1;
-        }
+      case LCEC_EL5002_PARAM_DIS_FRAME_ERR:    cfg[ch].dis_frame_err    = p->value.bit ? 1 : 0; break;
+      case LCEC_EL5002_PARAM_EN_PWR_FAIL_CHK:  cfg[ch].en_pwr_fail_chk  = p->value.bit ? 1 : 0; break;
+      case LCEC_EL5002_PARAM_EN_INHIBIT_TIME:  cfg[ch].en_inhibit_time  = p->value.bit ? 1 : 0; break;
+      case LCEC_EL5002_PARAM_CODING:           cfg[ch].coding           = (uint8_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_BAUDRATE:         cfg[ch].baudrate         = (uint8_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_CLK_JIT_COMP:     cfg[ch].clk_jit_comp     = (uint8_t)p->value.bit; break;
+      case LCEC_EL5002_PARAM_FRAME_TYPE:       cfg[ch].frame_type       = (uint8_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_FRAME_SIZE:       cfg[ch].frame_size       = (uint16_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_DATA_LEN:         cfg[ch].data_len         = (uint16_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_MIN_INHIBIT_TIME: cfg[ch].min_inhibit_time = (uint16_t)p->value.u32; break;
+      case LCEC_EL5002_PARAM_NO_CLK_BURSTS:    cfg[ch].no_clk_bursts    = (uint16_t)p->value.u32; break;
+      default:
+        rtapi_print_msg(RTAPI_MSG_WARN,
+          LCEC_MSG_PFX "slave %s.%s: unknown modParam id 0x%x ignored\n",
+          master->name, slave->name, p->id);
         break;
     }
+  }
+
+  // write SSI settings (object 0x80n0) per channel.  Only objects that differ
+  // from the Beckhoff factory default are written, so an unset XML parameter
+  // leaves the device at its own (identical) default and produces no traffic.
+  // Failures are non-fatal: the device keeps its current value.
+  for (ch = 0; ch < LCEC_EL5002_CHANS; ch++) {
+    base = 0x8000 + (ch << 4);
+
+    if (cfg[ch].dis_frame_err != DEF_DIS_FRAME_ERR)
+      if (lcec_write_sdo8(slave, base, 0x01, cfg[ch].dis_frame_err) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:01 (DisFrameErr) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].en_pwr_fail_chk != DEF_EN_PWR_FAIL_CHK)
+      if (lcec_write_sdo8(slave, base, 0x02, cfg[ch].en_pwr_fail_chk) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:02 (EnPwrFailChk) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].en_inhibit_time != DEF_EN_INHIBIT_TIME)
+      if (lcec_write_sdo8(slave, base, 0x03, cfg[ch].en_inhibit_time) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:03 (EnInhibitTime) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].coding != DEF_CODING)
+      if (lcec_write_sdo8(slave, base, 0x06, cfg[ch].coding) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:06 (Coding) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].baudrate != DEF_BAUDRATE)
+      if (lcec_write_sdo8(slave, base, 0x09, cfg[ch].baudrate) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:09 (Baudrate) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].clk_jit_comp != DEF_CLK_JIT_COMP)
+      if (lcec_write_sdo8(slave, base, 0x0c, cfg[ch].clk_jit_comp) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:0C (ClkJitComp) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].frame_type != DEF_FRAME_TYPE)
+      if (lcec_write_sdo8(slave, base, 0x0f, cfg[ch].frame_type) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:0F (FrameType) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].frame_size != DEF_FRAME_SIZE)
+      if (lcec_write_sdo16(slave, base, 0x11, cfg[ch].frame_size) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:11 (FrameSize) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].data_len != DEF_DATA_LEN)
+      if (lcec_write_sdo16(slave, base, 0x12, cfg[ch].data_len) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:12 (DataLen) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].min_inhibit_time != DEF_MIN_INHIBIT_TIME)
+      if (lcec_write_sdo16(slave, base, 0x13, cfg[ch].min_inhibit_time) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:13 (MinInhibitTime) write failed\n", master->name, slave->name, ch, base);
+
+    if (cfg[ch].no_clk_bursts != DEF_NO_CLK_BURSTS)
+      if (lcec_write_sdo16(slave, base, 0x14, cfg[ch].no_clk_bursts) != 0)
+        rtapi_print_msg(RTAPI_MSG_WARN, LCEC_MSG_PFX
+          "slave %s.%s ch%d: SDO %04x:14 (NoClkBursts) write failed\n", master->name, slave->name, ch, base);
   }
 
   // initialize callbacks

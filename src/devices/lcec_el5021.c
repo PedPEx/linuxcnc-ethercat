@@ -50,10 +50,23 @@
  *                      enc.status-input-c enc.sync-error
  *                      enc.txpdo-state    enc.txpdo-toggle
  *                      enc.counter-value  enc.latch-value
+ *                      enc.pos            (scaled, signed float position)
  *                      enc.frequency-error enc.amplitude-error
  *                      enc.frequency-error-count enc.amplitude-error-count
  *   Outputs (HAL_IN):  enc.enable-latch-c enc.set-counter
  *                      enc.set-counter-value
+ *
+ *   Parameters (HAL_RW): enc.pos-scale  (float, counts per user unit)
+ *
+ * enc.pos is derived in read() from the raw UINT32 counter:
+ *   pos = (int32_t)counter_value / pos_scale
+ * The unsigned hardware counter is reinterpreted as a signed two's-complement
+ * value first, so the position can cross the counter's zero point into the
+ * negative range without a 2^32 jump.  This float output feeds
+ * pid.<axis>.feedback and joint.<n>.motor-pos-fb directly, so no conv_* or
+ * scale components are needed in the HAL file.  A negative pos-scale inverts
+ * the counting direction.  The raw enc.counter-value (UINT32) is kept
+ * unchanged for backward compatibility and diagnostics.
  */
 
 #include "../lcec.h"
@@ -156,6 +169,7 @@ typedef struct {
   hal_bit_t *txpdo_toggle;        /*!< 6000:10 toggles on each PDO update     */
   hal_u32_t *counter_value;       /*!< 6000:11 encoder counter (32-bit)       */
   hal_u32_t *latch_value;         /*!< 6000:12 latched counter value          */
+  hal_float_t *pos;               /*!< derived: (s32)counter_value / pos_scale */
   hal_bit_t *frequency_error;     /*!< 6001:04 fmax exceeded                  */
   hal_bit_t *amplitude_error;     /*!< 6001:05 SinCos amplitude too low       */
   hal_u32_t *frequency_error_cnt; /*!< A000:11 cumulative freq error count    */
@@ -165,6 +179,9 @@ typedef struct {
   hal_bit_t *enable_latch_c;      /*!< 7000:01 arm C-input latch              */
   hal_bit_t *set_counter;         /*!< 7000:03 trigger counter preset         */
   hal_u32_t *set_counter_value;   /*!< 7000:11 preset target value            */
+
+  /* HAL parameters (stored by value, not as pointer) */
+  hal_float_t pos_scale;          /*!< counts per user unit for enc.pos; def 1.0 */
 
 } lcec_el5021_data_t;
 
@@ -188,6 +205,8 @@ static const lcec_pindesc_t slave_pins[] = {
     "%s.%s.%s.enc.counter-value"},
   {HAL_U32, HAL_OUT, offsetof(lcec_el5021_data_t, latch_value),
     "%s.%s.%s.enc.latch-value"},
+  {HAL_FLOAT, HAL_OUT, offsetof(lcec_el5021_data_t, pos),
+    "%s.%s.%s.enc.pos"},
   {HAL_BIT, HAL_OUT, offsetof(lcec_el5021_data_t, frequency_error),
     "%s.%s.%s.enc.frequency-error"},
   {HAL_BIT, HAL_OUT, offsetof(lcec_el5021_data_t, amplitude_error),
@@ -202,6 +221,18 @@ static const lcec_pindesc_t slave_pins[] = {
     "%s.%s.%s.enc.set-counter"},
   {HAL_U32, HAL_IN,  offsetof(lcec_el5021_data_t, set_counter_value),
     "%s.%s.%s.enc.set-counter-value"},
+  {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
+};
+
+/* ======================================================================
+ * HAL parameter descriptor table
+ *
+ * lcec_param_newf_list() reuses the lcec_pindesc_t layout; the "dir" field
+ * carries a hal_param_dir_t value (HAL_RW / HAL_RO) instead of a pin dir.
+ * ====================================================================== */
+static const lcec_pindesc_t slave_params[] = {
+  {HAL_FLOAT, HAL_RW, offsetof(lcec_el5021_data_t, pos_scale),
+    "%s.%s.%s.enc.pos-scale"},
   {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
@@ -306,6 +337,17 @@ int lcec_el5021_init(int comp_id, lcec_slave_t *slave) {
         LCEC_MODULE_NAME, master->name, slave->name)) != 0) {
     return err;
   }
+
+  /* --- HAL parameters --- */
+  if ((err = lcec_param_newf_list(hal_data, slave_params,
+        LCEC_MODULE_NAME, master->name, slave->name)) != 0) {
+    return err;
+  }
+
+  /* Default scale of 1.0 -> enc.pos reports raw signed counts until the HAL
+   * sets a real value (setp lcec.<m>.<s>.enc.pos-scale ...).  hal_malloc()
+   * memory is not guaranteed zeroed, so this initialisation is required.    */
+  hal_data->pos_scale = 1.0;
 
   /* --- Collect modParam overrides --- */
   for (p = slave->modparams; p != NULL && p->id >= 0; p++) {
@@ -419,6 +461,17 @@ static void lcec_el5021_read(lcec_slave_t *slave, long period) {
   *hal_data->txpdo_toggle     = EC_READ_BIT(pd + hal_data->txpdo_toggle_os,     hal_data->txpdo_toggle_bp);
   *hal_data->counter_value    = EC_READ_U32(pd + hal_data->counter_value_os);
   *hal_data->latch_value      = EC_READ_U32(pd + hal_data->latch_value_os);
+
+  /* Derived signed, scaled position for direct use as FLOAT feedback.
+   * Reinterpret the unsigned counter as signed two's-complement so it can go
+   * negative below the home point; divide by pos_scale (counts per unit).
+   * A zero scale would divide by zero, so fall back to raw signed counts.    */
+  {
+    hal_s32_t signed_cnt = (hal_s32_t)(*hal_data->counter_value);
+    *hal_data->pos = (hal_data->pos_scale != 0.0)
+                       ? ((double)signed_cnt / hal_data->pos_scale)
+                       : (double)signed_cnt;
+  }
 
   /* (6001:04 and 6001:05 registered above as part of 0x1A00) */
   *hal_data->frequency_error  = EC_READ_BIT(pd + hal_data->frequency_error_os,  hal_data->frequency_error_bp);
