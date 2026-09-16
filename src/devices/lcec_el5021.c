@@ -181,7 +181,7 @@ typedef struct {
   hal_u32_t *set_counter_value;   /*!< 7000:11 preset target value            */
 
   /* HAL parameters (stored by value, not as pointer) */
-  hal_float_t pos_scale;          /*!< counts per user unit for enc.pos; def 1.0 */
+  hal_float_t *pos_scale;          /*!< counts per user unit for enc.pos; def 1.0 */
 
 } lcec_el5021_data_t;
 
@@ -207,6 +207,8 @@ static const lcec_pindesc_t slave_pins[] = {
     "%s.%s.%s.enc.latch-value"},
   {HAL_FLOAT, HAL_OUT, offsetof(lcec_el5021_data_t, pos),
     "%s.%s.%s.enc.pos"},
+  {HAL_FLOAT, HAL_IO, offsetof(lcec_el5021_data_t, pos_scale),
+    "%s.%s.%s.enc.pos-scale"},
   {HAL_BIT, HAL_OUT, offsetof(lcec_el5021_data_t, frequency_error),
     "%s.%s.%s.enc.frequency-error"},
   {HAL_BIT, HAL_OUT, offsetof(lcec_el5021_data_t, amplitude_error),
@@ -221,18 +223,6 @@ static const lcec_pindesc_t slave_pins[] = {
     "%s.%s.%s.enc.set-counter"},
   {HAL_U32, HAL_IN,  offsetof(lcec_el5021_data_t, set_counter_value),
     "%s.%s.%s.enc.set-counter-value"},
-  {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
-};
-
-/* ======================================================================
- * HAL parameter descriptor table
- *
- * lcec_param_newf_list() reuses the lcec_pindesc_t layout; the "dir" field
- * carries a hal_param_dir_t value (HAL_RW / HAL_RO) instead of a pin dir.
- * ====================================================================== */
-static const lcec_pindesc_t slave_params[] = {
-  {HAL_FLOAT, HAL_RW, offsetof(lcec_el5021_data_t, pos_scale),
-    "%s.%s.%s.enc.pos-scale"},
   {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
@@ -338,16 +328,10 @@ int lcec_el5021_init(int comp_id, lcec_slave_t *slave) {
     return err;
   }
 
-  /* --- HAL parameters --- */
-  if ((err = lcec_param_newf_list(hal_data, slave_params,
-        LCEC_MODULE_NAME, master->name, slave->name)) != 0) {
-    return err;
-  }
-
   /* Default scale of 1.0 -> enc.pos reports raw signed counts until the HAL
    * sets a real value (setp lcec.<m>.<s>.enc.pos-scale ...).  hal_malloc()
    * memory is not guaranteed zeroed, so this initialisation is required.    */
-  hal_data->pos_scale = 1.0;
+  *(hal_data->pos_scale) = 1.0;
 
   /* --- Collect modParam overrides --- */
   for (p = slave->modparams; p != NULL && p->id >= 0; p++) {
@@ -468,8 +452,8 @@ static void lcec_el5021_read(lcec_slave_t *slave, long period) {
    * A zero scale would divide by zero, so fall back to raw signed counts.    */
   {
     hal_s32_t signed_cnt = (hal_s32_t)(*hal_data->counter_value);
-    *hal_data->pos = (hal_data->pos_scale != 0.0)
-                       ? ((double)signed_cnt / hal_data->pos_scale)
+    *hal_data->pos = (*hal_data->pos_scale != 0.0)
+                       ? ((double)signed_cnt / *hal_data->pos_scale)
                        : (double)signed_cnt;
   }
 
