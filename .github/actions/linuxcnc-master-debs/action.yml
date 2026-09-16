@@ -13,6 +13,12 @@ inputs:
   distro:
     description: Matrix distro label, used in the cache key
     required: true
+  arch:
+    description: >-
+      Matrix arch label (amd64, arm64), used in the cache key. Cached debs
+      are arch-specific, so amd64 and arm64 builds must never share a key.
+    required: false
+    default: amd64
 
 runs:
   using: composite
@@ -40,7 +46,7 @@ runs:
       uses: actions/cache@v6
       with:
           path: linuxcnc-dist
-          key: linuxcnc-master-debs-${{ inputs.distro }}-${{ steps.sha.outputs.sha }}
+          key: linuxcnc-master-debs-${{ inputs.distro }}-${{ inputs.arch }}-${{ steps.sha.outputs.sha }}
 
     - name: Build linuxcnc master debs
       if: steps.cache.outputs.cache-hit != 'true'

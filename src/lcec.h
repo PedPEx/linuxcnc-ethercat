@@ -26,13 +26,14 @@
 extern "C" {
 #endif
 
-#include "ecrt.h"
-#include "hal.h"
+#include <ecrt.h>
+#include <hal.h>
 #include "lcec_conf.h"
+#include "lcec_hal_compat.h"
 #include "lcec_rtapi.h"
-#include "rtapi_ctype.h"
-#include "rtapi_math.h"
-#include "rtapi_string.h"
+#include <rtapi_ctype.h>
+#include <rtapi_math.h>
+#include <rtapi_string.h>
 
 #ifdef __cplusplus
 }
@@ -69,6 +70,8 @@ extern "C" {
 #define LCEC_MODUSOFT_VID   0x00000907
 #define LCEC_LICHUAN_VID    0x00000a79
 #define LCEC_RTELLIGENT_VID 0x00000a88
+#define LCEC_WECON_VID      0x00000eff
+#define LCEC_INOVANCE_VID   0x00100000
 
 // State update period (ns)
 #define LCEC_STATE_UPDATE_PERIOD 1000000000LL
@@ -187,8 +190,8 @@ typedef struct lcec_master_data {
 #ifdef RTAPI_TASK_PLL_SUPPORT
   hal_s32_t *pll_err;
   hal_s32_t *pll_out;
-  hal_u32_t pll_step;
-  hal_u32_t pll_max_err;
+  lcec_param_u32_t pll_step;
+  lcec_param_u32_t pll_max_err;
   hal_u32_t *pll_reset_cnt;
   hal_u32_t dc_phase_max_err;
   hal_s32_t *app_phase;         // Our execution phase in local cycle (ns, real-time)
@@ -197,7 +200,12 @@ typedef struct lcec_master_data {
   hal_s32_t *drift_mode;        // Input: 0=simple, 1=manual
   hal_s32_t *pll_drift;         // Input: debug offset added to PLL correction (ns)
   hal_s32_t *pll_final;         // Output: final PLL correction value sent to rtapi (ns)
+  hal_s32_t *dc_ref_err;        // Output: raw app_time vs DC reference clock offset (ns), diagnostic only
   int32_t auto_drift_delay;     // Internal: auto-drift delay counter
+  int32_t phase_locked;         // Internal: instantaneous phase-lock state (hysteresis)
+  int32_t phase_lock_cnt;       // Internal: consecutive locked cycles (dc-phased dwell)
+  int32_t phase_unlock_cnt;     // Internal: consecutive unlocked cycles (dc-phased dwell)
+  int32_t phase_lock_dwell;     // Internal: dwell cycles for dc-phased transitions (~200 ms)
 #endif
   // Domain working counter monitoring
   hal_u32_t *wkc;             // Output: current domain working counter
@@ -210,9 +218,16 @@ typedef struct lcec_master_data {
   // DC synchrony monitoring (broadcast read of 0x092C system time difference)
   hal_u32_t *dc_sync_diff;       // Output: upper estimate of max slave time diff (ns)
   hal_bit_t *dc_sync_converged;  // Output: dc_sync_diff below dc-sync-max threshold
-  hal_u32_t dc_sync_max;         // Param: convergence threshold (ns)
-  hal_bit_t dc_sync_monitor;     // Param: enable the per-cycle monitor datagram (default on)
+  lcec_param_u32_t dc_sync_max;         // Param: convergence threshold (ns)
+  lcec_param_bit_t dc_sync_monitor;     // Param: enable the per-cycle monitor datagram (default on)
   int dc_sync_miss_cnt;          // Internal: consecutive cycles without a monitor response
+  // Cycle time correlation: DC app time and the OS monotonic clock, sampled
+  // back-to-back each cycle, so external processes can map timestamps taken
+  // with clock_gettime(CLOCK_MONOTONIC) into the DC time domain
+  hal_u32_t *app_time_lo;   // Output: DC app time of this cycle, low 32 bits (ns)
+  hal_u32_t *app_time_hi;   // Output: DC app time of this cycle, high 32 bits
+  hal_u32_t *mono_time_lo;  // Output: monotonic time sampled with app time, low 32 bits (ns)
+  hal_u32_t *mono_time_hi;  // Output: monotonic time sampled with app time, high 32 bits
   // Phase calibration for sync_to_ref_clock=false mode
   int32_t phase_measure_cnt;  // Internal: measurement cycle counter
   int32_t phase_min;          // Internal: minimum app_phase during measurement

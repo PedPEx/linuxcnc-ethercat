@@ -22,7 +22,7 @@ apt repository at <https://linuxcnc-ethercat.github.io/apt/>, served
 from GitHub Pages.  It ships both `linuxcnc-ethercat` and the matching
 `ethercat-master` (the IgH EtherLab master rebuilt with fixes that
 have not been picked up upstream) for **Debian 11 / 12 / 13** on
-**amd64**.
+**amd64 and arm64**.
 
 > The previously-recommended openSUSE `science:EtherLab` repository is
 > no longer the preferred source: it serves the unmodified IgH build
