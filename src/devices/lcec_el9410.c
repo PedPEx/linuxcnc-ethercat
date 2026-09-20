@@ -33,6 +33,8 @@ ADD_TYPES(types)
 typedef struct {
   hal_bit_t *us_undervoltage;
   hal_bit_t *up_undervoltage;
+  hal_bit_t *us_ok;  // OP && !us_undervoltage
+  hal_bit_t *up_ok;  // OP && !up_undervoltage
   unsigned int us_undervoltage_os, us_undervoltage_bp;
   unsigned int up_undervoltage_os, up_undervoltage_bp;
 } lcec_el9410_data_t;
@@ -40,6 +42,10 @@ typedef struct {
 static const lcec_pindesc_t output_pins[] = {
     {HAL_BIT, HAL_OUT, offsetof(lcec_el9410_data_t, us_undervoltage), "%s.%s.%s.us-undervoltage"},
     {HAL_BIT, HAL_OUT, offsetof(lcec_el9410_data_t, up_undervoltage), "%s.%s.%s.up-undervoltage"},
+    // health outputs: high only when the terminal is operational AND the
+    // respective supply is not in undervoltage. Backwards compatible additions.
+    {HAL_BIT, HAL_OUT, offsetof(lcec_el9410_data_t, us_ok), "%s.%s.%s.us-ok"},
+    {HAL_BIT, HAL_OUT, offsetof(lcec_el9410_data_t, up_ok), "%s.%s.%s.up-ok"},
     {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
@@ -61,6 +67,8 @@ static int lcec_el9410_init(int comp_id, lcec_slave_t *slave) {
 
   LCEC_PIN_BIT_SET(hal_data->us_undervoltage, 0);
   LCEC_PIN_BIT_SET(hal_data->up_undervoltage, 0);
+  LCEC_PIN_BIT_SET(hal_data->us_ok, 0);
+  LCEC_PIN_BIT_SET(hal_data->up_ok, 0);
 
   slave->proc_read = lcec_el9410_read;
   return 0;
@@ -70,12 +78,23 @@ static int lcec_el9410_init(int comp_id, lcec_slave_t *slave) {
 static void lcec_el9410_read(lcec_slave_t *slave, long period) {
   uint8_t *pd = slave->master->process_data;
   lcec_el9410_data_t *hal_data = (lcec_el9410_data_t *)slave->hal_data;
+  int us_uv, up_uv;
 
   // wait for slave to be operational
   if (!slave->state.operational) {
+    // health outputs require OP -> force low while not operational
+    LCEC_PIN_BIT_SET(hal_data->us_ok, 0);
+    LCEC_PIN_BIT_SET(hal_data->up_ok, 0);
     return;
   }
 
-  LCEC_PIN_BIT_SET(hal_data->us_undervoltage, EC_READ_BIT(&pd[hal_data->us_undervoltage_os], hal_data->us_undervoltage_bp));
-  LCEC_PIN_BIT_SET(hal_data->up_undervoltage, EC_READ_BIT(&pd[hal_data->up_undervoltage_os], hal_data->up_undervoltage_bp));
+  us_uv = EC_READ_BIT(&pd[hal_data->us_undervoltage_os], hal_data->us_undervoltage_bp);
+  up_uv = EC_READ_BIT(&pd[hal_data->up_undervoltage_os], hal_data->up_undervoltage_bp);
+
+  LCEC_PIN_BIT_SET(hal_data->us_undervoltage, us_uv);
+  LCEC_PIN_BIT_SET(hal_data->up_undervoltage, up_uv);
+
+  // operational here, so ok == !undervoltage
+  LCEC_PIN_BIT_SET(hal_data->us_ok, !us_uv);
+  LCEC_PIN_BIT_SET(hal_data->up_ok, !up_uv);
 }

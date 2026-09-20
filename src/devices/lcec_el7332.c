@@ -1080,8 +1080,14 @@ static void lcec_el7332_read(lcec_slave_t *slave, long period) {
 #define SLOT_U32(r, p)  do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=0; slots[n].is_u32=1; slots[n].is_bool=0; n++; } while(0)
 #define SLOT_BIT(r, p)  do { slots[n].req=(r); slots[n].out=(p); slots[n].is_s8=0; slots[n].is_u32=0; slots[n].is_bool=1; n++; } while(0)
 
-    SLOT_S8 (hal_data->sdo_internal_temp,         hal_data->internal_temp);
-    SLOT_U32(hal_data->sdo_supply_voltage,         hal_data->supply_voltage);
+    /* F900 (temp/supply) is not readable without motor supply; the stage then
+     * raises chN.error and IgH floods dmesg with abort 0x08000022. Skip those
+     * two slots while either channel is in error. */
+    int both_ok = !(*hal_data->ch[0].error) && !(*hal_data->ch[1].error);
+    if (both_ok) {
+      SLOT_S8 (hal_data->sdo_internal_temp,  hal_data->internal_temp);
+      SLOT_U32(hal_data->sdo_supply_voltage, hal_data->supply_voltage);
+    }
 
     for (ch = 0; ch < 2; ch++) {
       lcec_el7332_ch_t *c = &hal_data->ch[ch];
