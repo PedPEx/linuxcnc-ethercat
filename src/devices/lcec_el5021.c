@@ -34,12 +34,19 @@
  *  └──────────────────────────────────────────────────────────────────┘
  *  NOTE: 0x1A01 does not exist on this HW revision.
  *
- * Startup SDOs (written before SAFEOP via lcec_write_sdo*):
+ * Startup SDOs (written before SAFEOP via lcec_write_sdo*, ALWAYS written
+ * on every start, independent of the configured value):
  *   8000:01  Enable C reset          (modParam enableCReset,        def 0)
  *   8000:0E  Reversion of rotation   (modParam reversionOfRotation, def 0)
  *   8001:01  Enable frequency error  (modParam enableFrequencyError, def 1)
  *   8001:02  Enable amplitude error  (modParam enableAmplitudeError, def 1)
  *   8001:11  Analog resolution       (modParam analogResolution,     def 10)
+ *
+ *   The EL5021 retains its CoE settings (e.g. from a previous TwinCAT
+ *   session), so the factory default can never be assumed. An earlier
+ *   revision skipped the write when the configured value equalled the
+ *   default; this left 8000:01 = 1 on all three terminals and caused a
+ *   counter reset at every reference mark (following error during homing).
  *
  * Cyclic SDO reads (mailbox, via ec_sdo_request_t):
  *   A000:11  frequency error counter (UINT16)
@@ -77,7 +84,9 @@
 #endif
 
 /* ======================================================================
- * Factory defaults (confirmed on hardware)
+ * Defaults for the modParams (Beckhoff factory values). These are only
+ * the values used when a modParam is absent from the XML; they are NOT
+ * assumed to be the current state of the terminal.
  * ====================================================================== */
 #define DEF_ENABLE_C_RESET         0  /* 8000:01 */
 #define DEF_REVERSION_OF_ROTATION  0  /* 8000:0E */
@@ -287,7 +296,7 @@ int lcec_el5021_init(int comp_id, lcec_slave_t *slave) {
   lcec_slave_modparam_t *p;
   int err;
 
-  /* Settings with factory defaults – overridden by XML modParams          */
+  /* Settings with defaults – overridden by XML modParams                  */
   uint8_t cfg_enable_c_reset        = DEF_ENABLE_C_RESET;
   uint8_t cfg_reversion_of_rotation = DEF_REVERSION_OF_ROTATION;
   uint8_t cfg_enable_freq_error     = DEF_ENABLE_FREQ_ERROR;
@@ -354,55 +363,44 @@ int lcec_el5021_init(int comp_id, lcec_slave_t *slave) {
     }
   }
 
-  /* --- Write 8000:xx ENC Settings (max subindex 0x0E on this HW revision)
+  /* --- Write 8000:xx / 8001:xx ENC settings ------------------------------
    *
-   * Only written when the value differs from the factory default, to avoid
-   * unnecessary SDO traffic to already-correct registers.  Failures are
-   * non-fatal: the device retains its current (factory-default) value, which
-   * is safe for normal operation.  Use XML <sdoConfig> if a hard write is
-   * required regardless of current value.                                    */
+   * All settings are written unconditionally on every start. The CoE values
+   * of the EL5021 are retained in the terminal (e.g. from a previous TwinCAT
+   * session), so the factory default can never be assumed. Skipping the
+   * write when the configured value equalled the default left 8000:01 = 1
+   * on all three terminals and caused a counter reset at every reference
+   * mark. Failures are reported but non-fatal.                              */
 
-  /* 8000:01  Enable C reset (BOOLEAN, factory default: 0 = disabled) */
-  if (cfg_enable_c_reset != DEF_ENABLE_C_RESET) {
-    if (lcec_write_sdo8(slave, 0x8000, 0x01, cfg_enable_c_reset) != 0)
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "slave %s.%s: SDO 0x8000:01 (enableCReset) write failed"
-        " – device keeps current value\n", master->name, slave->name);
-  }
+  /* 8000:01  Enable C reset (BOOLEAN) */
+  if (lcec_write_sdo8(slave, 0x8000, 0x01, cfg_enable_c_reset) != 0)
+    rtapi_print_msg(RTAPI_MSG_WARN,
+      LCEC_MSG_PFX "slave %s.%s: SDO 0x8000:01 (enableCReset) write failed\n",
+      master->name, slave->name);
 
-  /* 8000:0E  Reversion of rotation (BOOLEAN, factory default: 0 = normal) */
-  if (cfg_reversion_of_rotation != DEF_REVERSION_OF_ROTATION) {
-    if (lcec_write_sdo8(slave, 0x8000, 0x0E, cfg_reversion_of_rotation) != 0)
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "slave %s.%s: SDO 0x8000:0E (reversionOfRotation) write failed"
-        " – device keeps current value\n", master->name, slave->name);
-  }
+  /* 8000:0E  Reversion of rotation (BOOLEAN) */
+  if (lcec_write_sdo8(slave, 0x8000, 0x0E, cfg_reversion_of_rotation) != 0)
+    rtapi_print_msg(RTAPI_MSG_WARN,
+      LCEC_MSG_PFX "slave %s.%s: SDO 0x8000:0E (reversionOfRotation) write failed\n",
+      master->name, slave->name);
 
-  /* --- Write 8001:xx ENC SinCos Settings --- */
+  /* 8001:01  Enable frequency error (BOOLEAN) */
+  if (lcec_write_sdo8(slave, 0x8001, 0x01, cfg_enable_freq_error) != 0)
+    rtapi_print_msg(RTAPI_MSG_WARN,
+      LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:01 (enableFrequencyError) write failed\n",
+      master->name, slave->name);
 
-  /* 8001:01  Enable frequency error (BOOLEAN, factory default: 1 = enabled) */
-  if (cfg_enable_freq_error != DEF_ENABLE_FREQ_ERROR) {
-    if (lcec_write_sdo8(slave, 0x8001, 0x01, cfg_enable_freq_error) != 0)
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:01 (enableFrequencyError) write failed"
-        " – device keeps current value\n", master->name, slave->name);
-  }
+  /* 8001:02  Enable amplitude error (BOOLEAN) */
+  if (lcec_write_sdo8(slave, 0x8001, 0x02, cfg_enable_amp_error) != 0)
+    rtapi_print_msg(RTAPI_MSG_WARN,
+      LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:02 (enableAmplitudeError) write failed\n",
+      master->name, slave->name);
 
-  /* 8001:02  Enable amplitude error (BOOLEAN, factory default: 1 = enabled) */
-  if (cfg_enable_amp_error != DEF_ENABLE_AMP_ERROR) {
-    if (lcec_write_sdo8(slave, 0x8001, 0x02, cfg_enable_amp_error) != 0)
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:02 (enableAmplitudeError) write failed"
-        " – device keeps current value\n", master->name, slave->name);
-  }
-
-  /* 8001:11  Analog resolution in bits (UINT8, factory default: 10) */
-  if (cfg_analog_resolution != DEF_ANALOG_RESOLUTION) {
-    if (lcec_write_sdo8(slave, 0x8001, 0x11, cfg_analog_resolution) != 0)
-      rtapi_print_msg(RTAPI_MSG_WARN,
-        LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:11 (analogResolution) write failed"
-        " – device keeps current value\n", master->name, slave->name);
-  }
+  /* 8001:11  Analog resolution in bits (UINT8) */
+  if (lcec_write_sdo8(slave, 0x8001, 0x11, cfg_analog_resolution) != 0)
+    rtapi_print_msg(RTAPI_MSG_WARN,
+      LCEC_MSG_PFX "slave %s.%s: SDO 0x8001:11 (analogResolution) write failed\n",
+      master->name, slave->name);
 
   /* --- Cyclic SDO read requests for A000:11 / A000:12 error counters --- */
   if (!(hal_data->sdo_freq_err_cnt = ecrt_slave_config_create_sdo_request(
