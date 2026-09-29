@@ -1,3 +1,24 @@
+# Costum EtherCAT lcec drivers
+
+> **Disclaimer:** All EtherCAT drivers, LinuxCNC components and implementations were written by the AI agent Claude. The information in the readme and info pages was summarized and provided by me and written up by Claude. The whole iteration process and the different versions of e.g. the Danfoss driver (around 40 iterations) were summarized by Claude. Extensive tests were carried out by me.
+
+added or modified support for:
+  - EL1918 (modified) - all eight inputs can be read for diagnosis
+  - EK1914 (new) - fully tested
+  - EL5021 (new) - fully tested
+  - EL5101 (modified - comming soon™) - 32 bit counter and frequency measurement for spindle encoder
+  - EL7332 (new) - fully tested
+  - EL6002 (new) - lcec-driver in [src/devices/](src/devices/), Python interface in [examples/el6002/](examples/el6002/), untested & unused
+  - EL6224 (new) - only supports Siemens 3SU1400-2HL10-6AA0 as IO-Link slaves (up to four)
+  - EP5101-0011 (new) - fully tested, using 32 bit counter
+  - EL5002 (modified) - fault in modParam section fixed
+  - EL9410 (modified) - added voltage ok bits, backwards compatible
+  - Danfoss FC302 MCA124 (new) - fully tested, [FURTHER DETAILS](documentation/danfoss_fc302.md)
+
+
+<details>
+<summary>Original README</summary>
+
 # linuxcnc-ethercat
 
 This is a set of [LinuxCNC](https://linuxcnc.org/) drivers for
@@ -191,3 +212,5 @@ issue here.  Everything is new, and it may be broken.
 [API
 Documentation](https://linuxcnc-ethercat.github.io/linuxcnc-ethercat/doxygen/)
 via Doxygen is available, but incomplete.
+
+</details>
